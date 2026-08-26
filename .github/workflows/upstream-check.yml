@@ -1285,7 +1285,15 @@ jobs:
     needs:
       - detect
       - stable-ref
-    if: ${{ needs.stable-ref.result == 'success' }}
+    # stable-ref deliberately joins mutually exclusive jobs. A skipped
+    # alternative remains a transitive ancestor, so an explicit status
+    # function is required here to suppress GitHub's implicit success() gate.
+    if: >-
+      ${{
+        !cancelled() &&
+        needs.detect.result == 'success' &&
+        needs.stable-ref.result == 'success'
+      }}
     uses: ./.github/workflows/build.yml
     with:
       source_ref: ${{ needs.stable-ref.outputs.commit }}
@@ -1298,7 +1306,15 @@ jobs:
       - detect
       - stable-ref
       - stable-firmware
-    if: ${{ needs.stable-firmware.result == 'success' }}
+    # Keep the same explicit join semantics through publication; otherwise a
+    # skipped refresh/recovery alternative can suppress this successful path.
+    if: >-
+      ${{
+        !cancelled() &&
+        needs.detect.result == 'success' &&
+        needs.stable-ref.result == 'success' &&
+        needs.stable-firmware.result == 'success'
+      }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:

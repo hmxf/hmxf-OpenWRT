@@ -228,6 +228,25 @@ grep -Fq 'if (NR != 17' "$UPSTREAM_WORKFLOW" || \
 grep -Fq 'needs.stable-input-recovery.result == '\''success'\''' \
     "$UPSTREAM_WORKFLOW" || \
     die 'recovered locked inputs do not feed the canonical stable build'
+awk '
+    $0 == "  stable-firmware:" { inside = 1 }
+    $0 == "  stable-release:" { exit }
+    inside && /!cancelled[(][)]/ { status_gate = 1 }
+    inside && /needs[.]detect[.]result == '\''success'\''/ { detect = 1 }
+    inside && /needs[.]stable-ref[.]result == '\''success'\''/ { stable_ref = 1 }
+    END { exit !(status_gate && detect && stable_ref) }
+' "$UPSTREAM_WORKFLOW" || \
+    die 'canonical stable build can be suppressed by a skipped alternative ancestor'
+awk '
+    $0 == "  stable-release:" { inside = 1 }
+    $0 == "  nightly-capture:" { exit }
+    inside && /!cancelled[(][)]/ { status_gate = 1 }
+    inside && /needs[.]detect[.]result == '\''success'\''/ { detect = 1 }
+    inside && /needs[.]stable-ref[.]result == '\''success'\''/ { stable_ref = 1 }
+    inside && /needs[.]stable-firmware[.]result == '\''success'\''/ { firmware = 1 }
+    END { exit !(status_gate && detect && stable_ref && firmware) }
+' "$UPSTREAM_WORKFLOW" || \
+    die 'stable publication can be suppressed by a skipped alternative ancestor'
 grep -Fq '! -type d -print -quit' "$UPSTREAM_WORKFLOW" || \
     die 'nightly target artifacts allow nodes beside the sole target directory'
 grep -Fq "X-GitHub-Api-Version: 2026-03-10" "$RELEASE_HELPER" || \
