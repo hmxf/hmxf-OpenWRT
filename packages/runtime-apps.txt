@@ -1,0 +1,11 @@
+# Install these exact top-level packages from LuCI's package manager.  They are
+# deliberately absent from both firmware presets.
+luci-app-passwall
+luci-i18n-passwall-zh-cn
+luci-app-tailscale-community
+luci-i18n-tailscale-community-zh-cn
+luci-app-zerotier
+luci-i18n-zerotier-zh-cn
+luci-proto-wireguard
+luci-app-adblock-fast
+luci-i18n-adblock-fast-zh-cn

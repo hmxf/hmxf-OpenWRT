@@ -1,0 +1,118 @@
+name: Reusable production firmware build
+
+on:
+  workflow_call:
+    inputs:
+      source_ref:
+        description: Exact committed source revision to build; defaults to caller SHA
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        target:
+          - x86_64
+          - rpi4
+          - rpi5
+    steps:
+      - name: Check out configuration repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.source_ref || github.sha }}
+          persist-credentials: false
+      - name: Require an exact committed checkout
+        env:
+          REQUESTED_REF: ${{ inputs.source_ref }}
+        run: |
+          actual=$(git rev-parse HEAD)
+          [[ "$actual" =~ ^[0-9a-f]{40}$ ]]
+          if [[ -n "$REQUESTED_REF" ]]; then
+            [[ "$REQUESTED_REF" =~ ^[0-9a-f]{40}$ ]]
+            [[ "$actual" == "$REQUESTED_REF" ]]
+          fi
+      - name: Configure isolated locked-input directories
+        run: |
+          {
+            printf 'DOWNLOAD_DIR=%s\n' \
+              "$RUNNER_TEMP/locked-inputs/imagebuilders"
+            printf 'PACKAGE_SNAPSHOT_DIR=%s\n' \
+              "$RUNNER_TEMP/locked-inputs/package-snapshots"
+            printf 'PACKAGE_SNAPSHOT_BUNDLE_DIR=%s\n' \
+              "$RUNNER_TEMP/locked-inputs/package-snapshot-bundles"
+          } >> "$GITHUB_ENV"
+      - name: Read locked release
+        id: release
+        run: |
+          version=$(awk -F= '$1 == "IMMORTALWRT_VERSION" { print $2 }' locks/release.env)
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+      - name: Install ImageBuilder dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes build-essential curl file gawk gettext gzip python3 rsync shellcheck squashfs-tools unzip zstd
+      - name: Restore externally locked ImageBuilder and package snapshot
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: make prepare-inputs DEVICE="${{ matrix.target }}"
+      - name: Install x86 UEFI smoke-test dependencies
+        if: ${{ matrix.target == 'x86_64' }}
+        run: sudo apt-get install --yes ovmf qemu-system-x86
+      - name: Build ${{ matrix.target }}/full and minimal from one verified snapshot
+        run: |
+          make image DEVICE="${{ matrix.target }}" PRESET=full
+          make image DEVICE="${{ matrix.target }}" PRESET=minimal
+      - name: Require canonical production identities before upload
+        run: |
+          for preset in full minimal; do
+            info="out/${{ steps.release.outputs.version }}/${{ matrix.target }}/$preset/BUILD_INFO.txt"
+            grep -Fqx 'canonical_build=1' "$info"
+            grep -Fqx 'candidate_build=0' "$info"
+            grep -Fqx 'development_build=0' "$info"
+          done
+      - name: Upload verified full SquashFS images
+        if: ${{ github.event_name != 'pull_request' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: immortalwrt-${{ steps.release.outputs.version }}-${{ matrix.target }}-full-run-${{ github.run_id }}
+          path: out/${{ steps.release.outputs.version }}/${{ matrix.target }}/full/
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 90
+      - name: Upload verified minimal SquashFS images
+        if: ${{ github.event_name != 'pull_request' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: immortalwrt-${{ steps.release.outputs.version }}-${{ matrix.target }}-minimal-run-${{ github.run_id }}
+          path: out/${{ steps.release.outputs.version }}/${{ matrix.target }}/minimal/
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 90
+      - name: Upload pull-request full test images
+        if: ${{ github.event_name == 'pull_request' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: test-pr-${{ github.event.pull_request.number }}-${{ matrix.target }}-full-run-${{ github.run_id }}
+          path: out/${{ steps.release.outputs.version }}/${{ matrix.target }}/full/
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 14
+      - name: Upload pull-request minimal test images
+        if: ${{ github.event_name == 'pull_request' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: test-pr-${{ github.event.pull_request.number }}-${{ matrix.target }}-minimal-run-${{ github.run_id }}
+          path: out/${{ steps.release.outputs.version }}/${{ matrix.target }}/minimal/
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 14

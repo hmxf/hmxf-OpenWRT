@@ -1,0 +1,87 @@
+name: Prepare a reviewed release-lock candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Stable version to prepare, or latest
+        required: true
+        default: latest
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  # `latest` can resolve to the same directory as an explicit version. Keep
+  # every refresh mutually exclusive; the script also holds a local flock.
+  group: lock-refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Check out configuration repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Install build, verification, and UEFI test tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes build-essential curl file gawk gettext gzip ovmf python3 qemu-system-x86 rsync shellcheck squashfs-tools unzip zstd
+      - name: Build candidate, capture APK inputs, and rebuild from the snapshot
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: make refresh-locks VERSION="$REQUESTED_VERSION"
+      - name: Resolve and validate the candidate version
+        id: candidate
+        shell: bash
+        run: |
+          mapfile -d '' release_locks < <(
+            find build/lock-refresh -mindepth 3 -type f \
+              -path '*/locks/release.env' -print0
+          )
+          [[ ${#release_locks[@]} -eq 1 ]]
+          candidate_dir=$(dirname -- "$(dirname -- "${release_locks[0]}")")
+          version=$(awk -F= '
+            $1 == "IMMORTALWRT_VERSION" { count += 1; value = $2 }
+            END { if (count == 1) print value; else exit 1 }
+          ' "${release_locks[0]}")
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ $(basename -- "$candidate_dir") == "$version" ]]
+          grep -Fqx "LOCKED_INPUT_RELEASE_TAG=hmxf-openwrt-inputs-$version" \
+            "${release_locks[0]}"
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+          printf 'directory=%s\n' "$candidate_dir" >> "$GITHUB_OUTPUT"
+      - name: Upload candidate locks, both builds, and package snapshots
+        id: reviewed_artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: immortalwrt-lock-candidate-${{ steps.candidate.outputs.version }}-run-${{ github.run_id }}
+          path: ${{ steps.candidate.outputs.directory }}/
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 90
+      - name: Record the immutable candidate identity for human review
+        env:
+          CANDIDATE_VERSION: ${{ steps.candidate.outputs.version }}
+          ARTIFACT_ID: ${{ steps.reviewed_artifact.outputs.artifact-id }}
+          ARTIFACT_SHA256: ${{ steps.reviewed_artifact.outputs.artifact-digest }}
+        run: |
+          set -euo pipefail
+          [[ "$CANDIDATE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$ARTIFACT_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          # shellcheck disable=SC2016
+          {
+            printf '### Reviewed candidate identity\n\n'
+            printf -- '- Version: `%s`\n' "$CANDIDATE_VERSION"
+            printf -- '- Run ID: `%s`\n' "$GITHUB_RUN_ID"
+            printf -- '- Artifact ID: `%s`\n' "$ARTIFACT_ID"
+            printf -- '- Artifact SHA-256: `%s`\n' "$ARTIFACT_SHA256"
+            printf -- '- Plan commit: `%s`\n\n' "$GITHUB_SHA"
+            printf '%s\n' \
+              'A rerun creates a new Artifact ID. Review the new bytes and use only the identity shown by that attempt.'
+          } >> "$GITHUB_STEP_SUMMARY"

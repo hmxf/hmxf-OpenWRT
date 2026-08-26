@@ -1,0 +1,10 @@
+config server 'server'
+	option url 'https://sysupgrade.immortalwrt.org'
+
+config client 'client'
+	option upgrade_packages '1'
+	option auto_search '0'
+	option advanced_mode '0'
+
+config owut 'owut'
+	option rootfs_size '3072'

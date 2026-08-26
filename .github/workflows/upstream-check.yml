@@ -1,0 +1,1776 @@
+name: Scheduled stable and nightly firmware releases
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Update channel to evaluate or force
+        required: true
+        default: auto
+        type: choice
+        options:
+          - auto
+          - check
+          - stable
+          - nightly
+      stable_version:
+        description: Stable X.Y.Z to build, or latest
+        required: true
+        default: latest
+        type: string
+  schedule:
+    # Daily, away from the high-load start of the hour. GitHub evaluates cron
+    # in UTC and runs only the workflow on the default branch.
+    - cron: '17 2 * * *'
+    # Best-effort public-repository schedule keepalive. This has a separate
+    # event so its write permission stays isolated from update detection.
+    - cron: '43 3 1 * *'
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: hmxf-openwrt-release-publication
+  cancel-in-progress: false
+
+jobs:
+  locked-input-draft-probe:
+    name: Probe current locked-input draft visibility
+    if: >-
+      ${{
+        github.event_name != 'schedule' ||
+        github.event.schedule == '17 2 * * *'
+      }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    # GitHub lists draft Releases only to callers with push access. Keep this
+    # write-scoped token in a mutation-free job instead of exposing it to the
+    # upstream parsers in detect.
+    permissions:
+      contents: write
+    outputs:
+      present: ${{ steps.probe.outputs.present }}
+    steps:
+      - name: Check out only the current lock identity
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Enumerate the exact locked-input tag without mutating it
+        id: probe
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for tool in awk cmp gh jq sort; do
+            command -v "$tool" >/dev/null
+          done
+          locked=$(awk -F= '
+            $1 == "IMMORTALWRT_VERSION" { count += 1; value = $2 }
+            END { if (count == 1) print value; else exit 1 }
+          ' locks/release.env)
+          tag=$(awk -F= '
+            $1 == "LOCKED_INPUT_RELEASE_TAG" { count += 1; value = $2 }
+            END { if (count == 1) print value; else exit 1 }
+          ' locks/release.env)
+          [[ "$locked" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$tag" == "hmxf-openwrt-inputs-$locked" ]]
+          pages="$RUNNER_TEMP/locked-input-release-pages.json"
+          matches="$RUNNER_TEMP/locked-input-release-matches.json"
+          gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+            --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/releases?per_page=100" > "$pages"
+          jq --arg tag "$tag" \
+            '[.[][] | select(.tag_name == $tag)]' "$pages" > "$matches"
+          count=$(jq -er 'length' "$matches")
+          [[ "$count" =~ ^[0-9]+$ && "$count" -le 1 ]]
+          present=0
+          if [[ "$count" == 1 && $(jq -r '.[0].draft' "$matches") == true ]]; then
+            jq -e '
+              .[0].prerelease == false and
+              (.[0].assets | length) == 7 and
+              ([.[0].assets[].name] | unique | length) == 7 and
+              ([.[0].assets[].state] | all(. == "uploaded"))
+            ' "$matches" >/dev/null
+            expected_assets="$RUNNER_TEMP/locked-input-draft-expected.txt"
+            actual_assets="$RUNNER_TEMP/locked-input-draft-actual.txt"
+            {
+              printf '%s\n' SHA256SUMS
+              awk -F'|' '!/^#/ && NF == 9 { print $6 }' locks/targets.tsv
+              awk -F'|' '!/^#/ && NF == 5 { print $2 }' \
+                locks/package-snapshots.tsv
+            } | sort > "$expected_assets"
+            jq -r '.[0].assets[].name' "$matches" | sort > "$actual_assets"
+            [[ $(wc -l < "$expected_assets") -eq 7 ]]
+            [[ $(sort -u "$expected_assets" | wc -l) -eq 7 ]]
+            cmp -- "$expected_assets" "$actual_assets"
+            present=1
+          fi
+          printf 'present=%s\n' "$present" >> "$GITHUB_OUTPUT"
+
+  detect:
+    name: Classify synchronized upstream inputs
+    needs: locked-input-draft-probe
+    if: >-
+      ${{
+        github.event_name != 'schedule' ||
+        github.event.schedule == '17 2 * * *'
+      }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      channel: ${{ steps.classify.outputs.channel }}
+      reason: ${{ steps.classify.outputs.reason }}
+      stable_version: ${{ steps.classify.outputs.stable_version }}
+      fingerprint: ${{ steps.classify.outputs.fingerprint }}
+    steps:
+      - name: Check out the current release plan
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Detect stable, source snapshot, and feed changes
+        id: classify
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || 'auto' }}
+          REQUESTED_STABLE: ${{ github.event_name == 'workflow_dispatch' && inputs.stable_version || 'latest' }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          WORKFLOW_REF: ${{ github.ref }}
+          LOCKED_INPUT_DRAFT_PRESENT: ${{ needs.locked-input-draft-probe.outputs.present }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2016
+          for tool in base64 cmp gh git jq; do
+            command -v "$tool" >/dev/null
+          done
+          [[ "$REQUESTED_MODE" =~ ^(auto|check|stable|nightly)$ ]]
+          [[ "$REQUESTED_STABLE" == latest || \
+             "$REQUESTED_STABLE" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ -n "$DEFAULT_BRANCH" ]]
+          git check-ref-format "refs/heads/$DEFAULT_BRANCH" >/dev/null
+          if [[ "$REQUESTED_MODE" != check ]]; then
+            [[ "$WORKFLOW_REF" == "refs/heads/$DEFAULT_BRANCH" ]] || {
+              printf '%s\n' \
+                'error: production update modes must run from the default branch' >&2
+              exit 1
+            }
+          fi
+          locked=$(awk -F= '$1 == "IMMORTALWRT_VERSION" { print $2 }' locks/release.env)
+          [[ "$locked" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+
+          api_get_optional() {
+            local endpoint=$1
+            local destination=$2
+            local error_file status
+            error_file=$(mktemp "$RUNNER_TEMP/github-api-error.XXXXXXXX")
+            if gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+                "$endpoint" > "$destination" 2> "$error_file"; then
+              rm -f -- "$error_file"
+              return 0
+            else
+              status=$?
+            fi
+            if grep -Fq '(HTTP 404)' "$error_file"; then
+              rm -f -- "$error_file"
+              return 1
+            fi
+            cat "$error_file" >&2
+            rm -f -- "$error_file"
+            printf 'error: GitHub API request failed for %s (status %s)\n' \
+              "$endpoint" "$status" >&2
+            return 2
+          }
+
+          write_expected_firmware_assets() {
+            local channel=$1
+            local identity=$2
+            local destination=$3
+            local image_version release_label target preset subtarget profile kind
+            case "$channel" in
+              stable)
+                [[ "$identity" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+                image_version=$identity
+                release_label=$identity
+                ;;
+              nightly)
+                [[ "$identity" =~ ^[0-9a-f]{64}$ ]]
+                image_version=SNAPSHOT
+                release_label="nightly-$identity"
+                ;;
+              *) return 1 ;;
+            esac
+            {
+              printf '%s\n' RELEASE_NOTES.md SHA256SUMS
+              for preset in full minimal; do
+                printf 'immortalwrt-%s-%s-x86-64-generic-squashfs-combined-efi.img.gz\n' \
+                  "$image_version" "$preset"
+                for target in rpi4 rpi5; do
+                  case "$target" in
+                    rpi4) subtarget=bcm2711; profile=rpi-4 ;;
+                    rpi5) subtarget=bcm2712; profile=rpi-5 ;;
+                  esac
+                  for kind in factory sysupgrade; do
+                    printf 'immortalwrt-%s-%s-bcm27xx-%s-%s-squashfs-%s.img.gz\n' \
+                      "$image_version" "$preset" "$subtarget" "$profile" \
+                      "$kind"
+                  done
+                done
+              done
+              for target in x86_64 rpi4 rpi5; do
+                for preset in full minimal; do
+                  printf 'hmxf-openwrt-%s-%s-%s-metadata.tar.zst\n' \
+                    "$release_label" "$target" "$preset"
+                done
+              done
+              if [[ "$channel" == nightly ]]; then
+                printf '%s\n' UPSTREAM_STATE.env NIGHTLY_BUILD.env \
+                  NIGHTLY_RELEASE.env NIGHTLY_TARGETS.tsv NIGHTLY_FEEDS.tsv \
+                  NIGHTLY_PACKAGE_SNAPSHOTS.tsv PLAN_INPUTS.sha256 \
+                  PLAN_INPUT_REVISION.txt
+                printf '%s\n' NIGHTLY_BUILD_CONTEXT.tar
+                printf '%s\n' \
+                  immortalwrt-imagebuilder-x86-64.Linux-x86_64.tar.zst \
+                  immortalwrt-imagebuilder-bcm27xx-bcm2711.Linux-x86_64.tar.zst \
+                  immortalwrt-imagebuilder-bcm27xx-bcm2712.Linux-x86_64.tar.zst \
+                  immortalwrt-SNAPSHOT-x86_64-package-snapshot.tar.zst \
+                  immortalwrt-SNAPSHOT-rpi4-package-snapshot.tar.zst \
+                  immortalwrt-SNAPSHOT-rpi5-package-snapshot.tar.zst
+              fi
+            } | sort > "$destination"
+          }
+
+          stable_present=0
+          stable_json="$RUNNER_TEMP/stable-release.json"
+          if api_get_optional \
+              "repos/$GITHUB_REPOSITORY/releases/tags/firmware-$locked" \
+              "$stable_json"; then
+            jq -e --arg tag "firmware-$locked" '
+              .tag_name == $tag and .draft == false and
+              .prerelease == false and (.assets | length) == 18 and
+              ([.assets[].name] | unique | length) == 18 and
+              ([.assets[].state] | all(. == "uploaded")) and
+              (has("immutable") and .immutable == true) and
+              ([.assets[].name] | index("SHA256SUMS")) != null and
+              ([.assets[].name] | index("RELEASE_NOTES.md")) != null
+            ' "$stable_json" >/dev/null
+            stable_expected="$RUNNER_TEMP/stable-expected-assets.txt"
+            stable_actual="$RUNNER_TEMP/stable-actual-assets.txt"
+            write_expected_firmware_assets stable "$locked" "$stable_expected"
+            [[ $(wc -l < "$stable_expected") -eq 18 ]]
+            jq -r '.assets[].name' "$stable_json" | sort > "$stable_actual"
+            cmp -- "$stable_expected" "$stable_actual"
+            stable_tag_json="$RUNNER_TEMP/stable-tag.json"
+            if api_get_optional \
+                "repos/$GITHUB_REPOSITORY/git/ref/tags/firmware-$locked" \
+                "$stable_tag_json"; then
+              jq -e --arg tag "firmware-$locked" '
+                .ref == ("refs/tags/" + $tag) and
+                .object.type == "commit" and
+                (.object.sha | test("^[0-9a-f]{40}$"))
+              ' "$stable_tag_json" >/dev/null
+            else
+              api_status=$?
+              printf 'error: published stable firmware has no valid tag\n' >&2
+              exit "$api_status"
+            fi
+            stable_present=1
+          else
+            api_status=$?
+            (( api_status == 1 )) || exit "$api_status"
+          fi
+          mkdir -p build/upstream
+          ./scripts/locks/check-upstream-updates.sh \
+            --output build/upstream/UPSTREAM_STATE.env \
+            --stable-release-present "$stable_present" \
+            --force "$REQUESTED_MODE" \
+            --stable-version "$REQUESTED_STABLE"
+          value() {
+            local key=$1
+            awk -F= -v wanted="$key" \
+              '$1 == wanted { count += 1; value = substr($0, length($1) + 2) }
+               END { if (count == 1) print value; else exit 1 }' \
+              build/upstream/UPSTREAM_STATE.env
+          }
+          channel=$(value CHANNEL)
+          reason=$(value REASON)
+          stable_version=$(value LATEST_STABLE_VERSION)
+          fingerprint=$(value SNAPSHOT_FINGERPRINT 2>/dev/null || true)
+          locked_from_state=$(value LOCKED_STABLE_VERSION)
+          [[ "$channel" =~ ^(none|deferred|stable|nightly)$ ]]
+          [[ "$reason" =~ ^[a-z0-9-]+$ ]]
+          [[ "$stable_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$locked_from_state" == "$locked" ]]
+
+          # A same-version bootstrap must consume the already reviewed,
+          # immutable inputs. It must never silently refresh that version from
+          # mutable live package repositories.
+          if [[ "$channel" == stable && \
+                "$reason" == missing-stable-firmware-release && \
+                "$stable_version" == "$locked" ]]; then
+            input_tag=$(awk -F= \
+              '$1 == "LOCKED_INPUT_RELEASE_TAG" { print $2 }' locks/release.env)
+            [[ "$input_tag" == "hmxf-openwrt-inputs-$locked" ]]
+            expected_inputs="$RUNNER_TEMP/expected-input-assets.txt"
+            actual_inputs="$RUNNER_TEMP/actual-input-assets.txt"
+            {
+              printf '%s\n' SHA256SUMS
+              awk -F'|' '!/^#/ && NF == 9 { print $6 }' locks/targets.tsv
+              awk -F'|' '!/^#/ && NF == 5 { print $2 }' \
+                locks/package-snapshots.tsv
+            } | sort > "$expected_inputs"
+            [[ $(wc -l < "$expected_inputs") -eq 7 ]]
+            [[ $(sort -u "$expected_inputs" | wc -l) -eq 7 ]]
+            input_json="$RUNNER_TEMP/locked-input-release.json"
+            if api_get_optional \
+                "repos/$GITHUB_REPOSITORY/releases/tags/$input_tag" \
+                "$input_json"; then
+              jq -e --arg tag "$input_tag" '
+                .tag_name == $tag and .draft == false and
+                .prerelease == false and (.assets | length) == 7 and
+                ([.assets[].name] | unique | length) == 7 and
+                ([.assets[].state] | all(. == "uploaded")) and
+                (has("immutable") and .immutable == true)
+              ' "$input_json" >/dev/null
+              jq -r '.assets[].name' "$input_json" | sort > "$actual_inputs"
+              cmp -- "$expected_inputs" "$actual_inputs"
+              input_tag_json="$RUNNER_TEMP/locked-input-tag.json"
+              if api_get_optional \
+                  "repos/$GITHUB_REPOSITORY/git/ref/tags/$input_tag" \
+                  "$input_tag_json"; then
+                jq -e --arg tag "$input_tag" '
+                  .ref == ("refs/tags/" + $tag) and
+                  .object.type == "commit" and
+                  (.object.sha | test("^[0-9a-f]{40}$"))
+                ' "$input_tag_json" >/dev/null
+                input_tag_commit=$(jq -er '.object.sha' "$input_tag_json")
+                basic_auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | \
+                  base64 -w0)
+                auth_key=http.https://github.com/.extraheader
+                git -c "$auth_key=AUTHORIZATION: basic $basic_auth" fetch \
+                  --no-tags --depth=1 origin "refs/tags/$input_tag"
+                fetched_input_commit=$(git rev-parse FETCH_HEAD)
+                [[ "$fetched_input_commit" == "$input_tag_commit" ]]
+                git diff --quiet "$fetched_input_commit" "$GITHUB_SHA" -- \
+                  locks configs/x86_64.config configs/rpi4.config \
+                  configs/rpi5.config || {
+                    printf '%s\n' \
+                      'error: locked-input tag tree differs from the current formal plan' >&2
+                    exit 1
+                  }
+              else
+                api_status=$?
+                printf 'error: locked-input release has no valid tag\n' >&2
+                exit "$api_status"
+              fi
+            else
+              api_status=$?
+              (( api_status == 1 )) || exit "$api_status"
+              [[ "$LOCKED_INPUT_DRAFT_PRESENT" =~ ^[01]$ ]]
+              if [[ "$LOCKED_INPUT_DRAFT_PRESENT" == 1 ]]; then
+                channel=stable
+                reason=recover-locked-input-draft
+              else
+                channel=deferred
+                reason=missing-locked-input-release
+              fi
+              sed -i -e "s/^CHANNEL=.*/CHANNEL=$channel/" \
+                -e "s/^REASON=.*/REASON=$reason/" \
+                build/upstream/UPSTREAM_STATE.env
+            fi
+          fi
+
+          if [[ "$channel" == nightly ]]; then
+            [[ "$fingerprint" =~ ^[0-9a-f]{64}$ ]]
+            release_pages="$RUNNER_TEMP/nightly-release-pages.json"
+            release_candidates="$RUNNER_TEMP/nightly-release-candidates.tsv"
+            gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+              --paginate --slurp \
+              "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+              > "$release_pages"
+            jq -r '
+              .[][] |
+              select(
+                .draft == false and .prerelease == true and
+                (.tag_name | test("^nightly-[0-9a-f]{64}$")) and
+                (.assets | length) == 33 and
+                ([.assets[].name] | unique | length) == 33 and
+                ([.assets[].state] | all(. == "uploaded")) and
+                (has("immutable") and .immutable == true)
+              ) |
+              [
+                .tag_name,
+                ([.assets[] | select(.name == "NIGHTLY_BUILD.env") | .id] |
+                  if length == 1 then .[0] else empty end),
+                ([.assets[] | select(.name == "UPSTREAM_STATE.env") | .id] |
+                  if length == 1 then .[0] else empty end),
+                ([.assets[] | select(.name == "SHA256SUMS") | .id] |
+                  if length == 1 then .[0] else empty end),
+                ([.assets[] | select(.name == "PLAN_INPUTS.sha256") | .id] |
+                  if length == 1 then .[0] else empty end),
+                ([.assets[] |
+                  select(.name == "NIGHTLY_PACKAGE_SNAPSHOTS.tsv") | .id] |
+                  if length == 1 then .[0] else empty end)
+              ] | select(length == 6) | @tsv
+            ' "$release_pages" > "$release_candidates"
+
+            manifest_digest() {
+              local manifest=$1
+              local wanted=$2
+              awk -v wanted="$wanted" '
+                NF == 2 && $1 ~ /^[0-9a-f]{64}$/ && $2 == wanted {
+                  count += 1
+                  digest = $1
+                }
+                END { if (count == 1) print digest; else exit 1 }
+              ' "$manifest"
+            }
+            validate_build_state() {
+              local state=$1
+              awk -F= '
+                BEGIN {
+                  allowed["NIGHTLY_BUILD_SCHEMA"] = 1
+                  allowed["UPSTREAM_FINGERPRINT"] = 1
+                  allowed["PLAN_INPUTS_SHA256"] = 1
+                  allowed["PACKAGE_SNAPSHOTS_SHA256"] = 1
+                  allowed["PACKAGE_SNAPSHOT_LOCK_SHA256"] = 1
+                  allowed["NIGHTLY_FINGERPRINT"] = 1
+                }
+                $0 !~ /^[A-Z][A-Z0-9_]*=[A-Za-z0-9._:/+-]+$/ ||
+                  !($1 in allowed) || seen[$1]++ { exit 1 }
+                END { if (NR != 6) exit 1 }
+              ' "$state"
+            }
+            validate_nightly_upstream_state() {
+              local state=$1
+              awk -F= '
+                BEGIN {
+                  split("STATE_SCHEMA CHANNEL REASON LOCKED_STABLE_VERSION LATEST_STABLE_VERSION SNAPSHOT_VERSION_CODE SNAPSHOT_SOURCE_COMMIT SNAPSHOT_FEEDS_SHA256 SNAPSHOT_TARGETS_SHA256 SNAPSHOT_PACKAGES_SHA256 SNAPSHOT_FINGERPRINT NIGHTLY_IMAGEBUILDER_X86_64_FILE NIGHTLY_IMAGEBUILDER_X86_64_SHA256 NIGHTLY_IMAGEBUILDER_RPI4_FILE NIGHTLY_IMAGEBUILDER_RPI4_SHA256 NIGHTLY_IMAGEBUILDER_RPI5_FILE NIGHTLY_IMAGEBUILDER_RPI5_SHA256", keys, " ")
+                  for (key in keys) allowed[keys[key]] = 1
+                }
+                $0 !~ /^[A-Z][A-Z0-9_]*=[A-Za-z0-9._:+\/-]+$/ ||
+                  !($1 in allowed) || seen[$1]++ { exit 1 }
+                { value[$1] = $2 }
+                END {
+                  version_commit = value["SNAPSHOT_VERSION_CODE"]
+                  sub(/^r[0-9]+-/, "", version_commit)
+                  if (NR != 17 || value["STATE_SCHEMA"] != "1" ||
+                      value["CHANNEL"] != "nightly" ||
+                      value["SNAPSHOT_VERSION_CODE"] !~
+                        /^r[0-9]+-[0-9a-f]{7,40}$/ ||
+                      value["SNAPSHOT_SOURCE_COMMIT"] !~ /^[0-9a-f]{40}$/ ||
+                      index(value["SNAPSHOT_SOURCE_COMMIT"], version_commit) != 1 ||
+                      value["SNAPSHOT_FEEDS_SHA256"] !~ /^[0-9a-f]{64}$/ ||
+                      value["SNAPSHOT_TARGETS_SHA256"] !~ /^[0-9a-f]{64}$/ ||
+                      value["SNAPSHOT_PACKAGES_SHA256"] !~ /^[0-9a-f]{64}$/ ||
+                      value["SNAPSHOT_FINGERPRINT"] !~ /^[0-9a-f]{64}$/ ||
+                      value["NIGHTLY_IMAGEBUILDER_X86_64_FILE"] !=
+                        "immortalwrt-imagebuilder-x86-64.Linux-x86_64.tar.zst" ||
+                      value["NIGHTLY_IMAGEBUILDER_RPI4_FILE"] !=
+                        "immortalwrt-imagebuilder-bcm27xx-bcm2711.Linux-x86_64.tar.zst" ||
+                      value["NIGHTLY_IMAGEBUILDER_RPI5_FILE"] !=
+                        "immortalwrt-imagebuilder-bcm27xx-bcm2712.Linux-x86_64.tar.zst" ||
+                      value["NIGHTLY_IMAGEBUILDER_X86_64_SHA256"] !~ /^[0-9a-f]{64}$/ ||
+                      value["NIGHTLY_IMAGEBUILDER_RPI4_SHA256"] !~ /^[0-9a-f]{64}$/ ||
+                      value["NIGHTLY_IMAGEBUILDER_RPI5_SHA256"] !~ /^[0-9a-f]{64}$/)
+                    exit 1
+                }
+              ' "$state"
+            }
+            build_value() {
+              local state=$1
+              local key=$2
+              awk -F= -v wanted="$key" '
+                $1 == wanted { count += 1; value = $2 }
+                END { if (count == 1) print value; else exit 1 }
+              ' "$state"
+            }
+            upstream_targets_digest() {
+              local state=$1 target key file digest
+              for target in x86_64 rpi4 rpi5; do
+                key=${target^^}
+                file=$(build_value "$state" \
+                  "NIGHTLY_IMAGEBUILDER_${key}_FILE")
+                digest=$(build_value "$state" \
+                  "NIGHTLY_IMAGEBUILDER_${key}_SHA256")
+                printf '%s|%s|%s\n' "$target" "$file" "$digest"
+              done | sha256sum | awk '{ print $1 }'
+            }
+
+            source ./scripts/lib/common.sh
+            current_plan_manifest="$RUNNER_TEMP/current-plan-inputs.sha256"
+            render_plan_input_manifest > "$current_plan_manifest"
+            if ! validate_nightly_upstream_state \
+                build/upstream/UPSTREAM_STATE.env; then
+              printf 'error: current nightly upstream state is malformed\n' >&2
+              exit 1
+            fi
+            current_revision=$(build_value build/upstream/UPSTREAM_STATE.env \
+              SNAPSHOT_VERSION_CODE)
+            current_commit=$(build_value build/upstream/UPSTREAM_STATE.env \
+              SNAPSHOT_SOURCE_COMMIT)
+            current_feeds=$(build_value build/upstream/UPSTREAM_STATE.env \
+              SNAPSHOT_FEEDS_SHA256)
+            current_targets=$(build_value build/upstream/UPSTREAM_STATE.env \
+              SNAPSHOT_TARGETS_SHA256)
+            current_packages=$(build_value build/upstream/UPSTREAM_STATE.env \
+              SNAPSHOT_PACKAGES_SHA256)
+            current_version_commit=${current_revision#*-}
+            [[ "$current_revision" =~ ^r[0-9]+-[0-9a-f]{7,40}$ && \
+               "$current_commit" =~ ^[0-9a-f]{40}$ && \
+               "${current_commit:0:${#current_version_commit}}" == \
+                 "$current_version_commit" && \
+               "$current_feeds" =~ ^[0-9a-f]{64}$ && \
+               "$current_targets" =~ ^[0-9a-f]{64}$ && \
+               "$current_packages" =~ ^[0-9a-f]{64}$ && \
+               $(upstream_targets_digest build/upstream/UPSTREAM_STATE.env) == \
+                 "$current_targets" && \
+               $(printf '%s\n%s\n%s\n%s\n%s\n' "$current_revision" \
+                 "$current_commit" "$current_feeds" "$current_targets" \
+                 "$current_packages" | \
+                 sha256sum | awk '{ print $1 }') == "$fingerprint" ]]
+
+            already_published=0
+            # A malformed historical prerelease is not valid durable state.
+            # Ignore that candidate and keep scanning; only GitHub API
+            # transport/authorization failures abort the detector.
+            while IFS=$'\t' read -r candidate_tag build_id state_id sums_id \
+                plan_id snapshots_id; do
+              if ! [[ "$candidate_tag" =~ ^nightly-[0-9a-f]{64}$ && \
+                    "$build_id" =~ ^[1-9][0-9]*$ && \
+                    "$state_id" =~ ^[1-9][0-9]*$ && \
+                    "$sums_id" =~ ^[1-9][0-9]*$ && \
+                    "$plan_id" =~ ^[1-9][0-9]*$ && \
+                    "$snapshots_id" =~ ^[1-9][0-9]*$ ]]; then
+                continue
+              fi
+              candidate_dir=$(mktemp -d \
+                "$RUNNER_TEMP/nightly-provenance.XXXXXXXX")
+              gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+                -H 'Accept: application/octet-stream' \
+                "repos/$GITHUB_REPOSITORY/releases/assets/$build_id" \
+                > "$candidate_dir/NIGHTLY_BUILD.env"
+              gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+                -H 'Accept: application/octet-stream' \
+                "repos/$GITHUB_REPOSITORY/releases/assets/$sums_id" \
+                > "$candidate_dir/SHA256SUMS"
+              if ! awk '
+                  NF != 2 || $1 !~ /^[0-9a-f]{64}$/ ||
+                    $2 !~ /^[A-Za-z0-9][A-Za-z0-9+._-]*$/ || seen[$2]++ {
+                      exit 1
+                    }
+                  END { if (NR != 32) exit 1 }
+                ' "$candidate_dir/SHA256SUMS"; then
+                rm -rf -- "$candidate_dir"
+                continue
+              fi
+              build_digest=$(manifest_digest "$candidate_dir/SHA256SUMS" \
+                NIGHTLY_BUILD.env) || {
+                  rm -rf -- "$candidate_dir"
+                  continue
+                }
+              if ! printf '%s  %s\n' "$build_digest" \
+                  "$candidate_dir/NIGHTLY_BUILD.env" | \
+                  sha256sum --strict --quiet -c -; then
+                rm -rf -- "$candidate_dir"
+                continue
+              fi
+              if ! validate_build_state "$candidate_dir/NIGHTLY_BUILD.env"; then
+                rm -rf -- "$candidate_dir"
+                continue
+              fi
+              if ! candidate_upstream=$(build_value \
+                  "$candidate_dir/NIGHTLY_BUILD.env" UPSTREAM_FINGERPRINT); then
+                rm -rf -- "$candidate_dir"
+                continue
+              fi
+              if [[ "$candidate_upstream" != "$fingerprint" ]]; then
+                rm -rf -- "$candidate_dir"
+                continue
+              fi
+
+              if ! build_schema=$(build_value \
+                    "$candidate_dir/NIGHTLY_BUILD.env" NIGHTLY_BUILD_SCHEMA) || \
+                  ! plan_digest=$(build_value \
+                    "$candidate_dir/NIGHTLY_BUILD.env" PLAN_INPUTS_SHA256) || \
+                  ! snapshots_digest=$(build_value \
+                    "$candidate_dir/NIGHTLY_BUILD.env" \
+                    PACKAGE_SNAPSHOTS_SHA256) || \
+                  ! snapshot_lock_digest=$(build_value \
+                    "$candidate_dir/NIGHTLY_BUILD.env" \
+                    PACKAGE_SNAPSHOT_LOCK_SHA256) || \
+                  ! final_fingerprint=$(build_value \
+                    "$candidate_dir/NIGHTLY_BUILD.env" NIGHTLY_FINGERPRINT) || \
+                  ! [[ "$build_schema" == 1 && \
+                    "$plan_digest" =~ ^[0-9a-f]{64}$ && \
+                    "$snapshots_digest" =~ ^[0-9a-f]{64}$ && \
+                    "$snapshot_lock_digest" =~ ^[0-9a-f]{64}$ && \
+                    "$final_fingerprint" =~ ^[0-9a-f]{64}$ ]]; then
+                rm -rf -- "$candidate_dir"
+                continue
+              fi
+              if ! plan_manifest_digest=$(manifest_digest \
+                    "$candidate_dir/SHA256SUMS" PLAN_INPUTS.sha256) || \
+                  ! snapshots_manifest_digest=$(manifest_digest \
+                    "$candidate_dir/SHA256SUMS" \
+                    NIGHTLY_PACKAGE_SNAPSHOTS.tsv); then
+                rm -rf -- "$candidate_dir"
+                continue
+              fi
+              gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+                -H 'Accept: application/octet-stream' \
+                "repos/$GITHUB_REPOSITORY/releases/assets/$plan_id" \
+                > "$candidate_dir/PLAN_INPUTS.sha256"
+              gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+                -H 'Accept: application/octet-stream' \
+                "repos/$GITHUB_REPOSITORY/releases/assets/$snapshots_id" \
+                > "$candidate_dir/NIGHTLY_PACKAGE_SNAPSHOTS.tsv"
+              if ! printf '%s  %s\n' "$plan_manifest_digest" \
+                    "$candidate_dir/PLAN_INPUTS.sha256" | \
+                    sha256sum --strict --quiet -c - || \
+                  ! printf '%s  %s\n' "$snapshots_manifest_digest" \
+                    "$candidate_dir/NIGHTLY_PACKAGE_SNAPSHOTS.tsv" | \
+                    sha256sum --strict --quiet -c - || \
+                  ! [[ $(sha256sum \
+                    "$candidate_dir/PLAN_INPUTS.sha256" | awk '{ print $1 }') \
+                    == "$plan_digest" ]] || \
+                  ! [[ $(sha256sum \
+                    "$candidate_dir/NIGHTLY_PACKAGE_SNAPSHOTS.tsv" | \
+                    awk '{ print $1 }') == "$snapshot_lock_digest" ]] || \
+                  ! cmp -s "$candidate_dir/PLAN_INPUTS.sha256" \
+                    "$current_plan_manifest"; then
+                rm -rf -- "$candidate_dir"
+                continue
+              fi
+              if ! actual_snapshot_content=$( \
+                    ./scripts/inputs/nightly-build-identity.sh content \
+                      "$candidate_dir/NIGHTLY_PACKAGE_SNAPSHOTS.tsv") || \
+                  ! calculated_final=$( \
+                    ./scripts/inputs/nightly-build-identity.sh fingerprint \
+                      "$fingerprint" "$candidate_dir/PLAN_INPUTS.sha256" \
+                      "$candidate_dir/NIGHTLY_PACKAGE_SNAPSHOTS.tsv") || \
+                  ! [[ "$actual_snapshot_content" == "$snapshots_digest" && \
+                    "$calculated_final" == "$final_fingerprint" && \
+                    "$candidate_tag" == "nightly-$final_fingerprint" ]]; then
+                rm -rf -- "$candidate_dir"
+                continue
+              fi
+
+              exact_release_json="$candidate_dir/release.json"
+              if api_get_optional \
+                  "repos/$GITHUB_REPOSITORY/releases/tags/$candidate_tag" \
+                  "$exact_release_json"; then
+                if ! jq -e --arg tag "$candidate_tag" '
+                    .tag_name == $tag and .draft == false and
+                    .prerelease == true and (.assets | length) == 33 and
+                    ([.assets[].name] | unique | length) == 33 and
+                    ([.assets[].state] | all(. == "uploaded")) and
+                    (has("immutable") and .immutable == true)
+                  ' "$exact_release_json" >/dev/null; then
+                  rm -rf -- "$candidate_dir"
+                  continue
+                fi
+              else
+                api_status=$?
+                if (( api_status == 1 )); then
+                  rm -rf -- "$candidate_dir"
+                  continue
+                fi
+                exit "$api_status"
+              fi
+              expected_names="$candidate_dir/expected-assets.txt"
+              actual_names="$candidate_dir/actual-assets.txt"
+              write_expected_firmware_assets nightly "$final_fingerprint" \
+                "$expected_names"
+              if ! [[ $(wc -l < "$expected_names") -eq 33 ]] || \
+                  ! jq -r '.assets[].name' "$exact_release_json" | \
+                    sort > "$actual_names" || \
+                  ! cmp -- "$expected_names" "$actual_names"; then
+                rm -rf -- "$candidate_dir"
+                continue
+              fi
+
+              if ! state_digest=$(manifest_digest \
+                  "$candidate_dir/SHA256SUMS" UPSTREAM_STATE.env); then
+                rm -rf -- "$candidate_dir"
+                continue
+              fi
+              gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+                -H 'Accept: application/octet-stream' \
+                "repos/$GITHUB_REPOSITORY/releases/assets/$state_id" \
+                > "$candidate_dir/UPSTREAM_STATE.env"
+              if ! printf '%s  %s\n' "$state_digest" \
+                    "$candidate_dir/UPSTREAM_STATE.env" | \
+                    sha256sum --strict --quiet -c - || \
+                  ! validate_nightly_upstream_state \
+                    "$candidate_dir/UPSTREAM_STATE.env" || \
+                  ! grep -Fqx 'CHANNEL=nightly' \
+                    "$candidate_dir/UPSTREAM_STATE.env" || \
+                  ! grep -Fqx "SNAPSHOT_FINGERPRINT=$fingerprint" \
+                    "$candidate_dir/UPSTREAM_STATE.env"; then
+                rm -rf -- "$candidate_dir"
+                continue
+              fi
+              historical_revision=$(build_value \
+                "$candidate_dir/UPSTREAM_STATE.env" SNAPSHOT_VERSION_CODE)
+              historical_commit=$(build_value \
+                "$candidate_dir/UPSTREAM_STATE.env" SNAPSHOT_SOURCE_COMMIT)
+              historical_feeds=$(build_value \
+                "$candidate_dir/UPSTREAM_STATE.env" SNAPSHOT_FEEDS_SHA256)
+              historical_targets=$(build_value \
+                "$candidate_dir/UPSTREAM_STATE.env" SNAPSHOT_TARGETS_SHA256)
+              historical_packages=$(build_value \
+                "$candidate_dir/UPSTREAM_STATE.env" SNAPSHOT_PACKAGES_SHA256)
+              historical_version_commit=${historical_revision#*-}
+              if ! [[ "$historical_revision" =~ ^r[0-9]+-[0-9a-f]{7,40}$ && \
+                    "$historical_commit" =~ ^[0-9a-f]{40}$ && \
+                    "${historical_commit:0:${#historical_version_commit}}" == \
+                      "$historical_version_commit" && \
+                    "$historical_feeds" =~ ^[0-9a-f]{64}$ && \
+                    "$historical_targets" =~ ^[0-9a-f]{64}$ && \
+                    "$historical_packages" =~ ^[0-9a-f]{64}$ && \
+                    $(upstream_targets_digest \
+                      "$candidate_dir/UPSTREAM_STATE.env") == \
+                      "$historical_targets" && \
+                    $(printf '%s\n%s\n%s\n%s\n%s\n' \
+                      "$historical_revision" "$historical_commit" \
+                      "$historical_feeds" "$historical_targets" \
+                      "$historical_packages" | sha256sum | \
+                      awk '{ print $1 }') == "$fingerprint" ]]; then
+                rm -rf -- "$candidate_dir"
+                continue
+              fi
+              tag_json="$candidate_dir/tag.json"
+              if api_get_optional \
+                  "repos/$GITHUB_REPOSITORY/git/ref/tags/$candidate_tag" \
+                  "$tag_json"; then
+                if ! jq -e --arg tag "$candidate_tag" '
+                  .ref == ("refs/tags/" + $tag) and
+                  .object.type == "commit" and
+                  (.object.sha | test("^[0-9a-f]{40}$"))
+                ' "$tag_json" >/dev/null; then
+                  rm -rf -- "$candidate_dir"
+                  continue
+                fi
+              else
+                api_status=$?
+                if (( api_status == 1 )); then
+                  rm -rf -- "$candidate_dir"
+                  continue
+                fi
+                exit "$api_status"
+              fi
+              rm -rf -- "$candidate_dir"
+              channel=none
+              reason='fingerprint-already-published'
+              sed -i -e 's/^CHANNEL=.*/CHANNEL=none/' \
+                -e 's/^REASON=.*/REASON=fingerprint-already-published/' \
+                build/upstream/UPSTREAM_STATE.env
+              already_published=1
+              break
+            done < "$release_candidates"
+            [[ "$already_published" =~ ^[01]$ ]]
+          fi
+          {
+            printf 'channel=%s\n' "$channel"
+            printf 'reason=%s\n' "$reason"
+            printf 'stable_version=%s\n' "$stable_version"
+            printf 'fingerprint=%s\n' "$fingerprint"
+          } >> "$GITHUB_OUTPUT"
+          {
+            printf '### Upstream classification\n\n'
+            printf -- "- Channel: \`%s\`\n" "$channel"
+            printf -- "- Reason: \`%s\`\n" "$reason"
+            printf -- "- Stable: \`%s\`\n" "$stable_version"
+            [[ -z "$fingerprint" ]] || \
+              printf -- "- Snapshot fingerprint: \`%s\`\n" "$fingerprint"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload the exact classified state
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: upstream-state-run-${{ github.run_id }}
+          path: build/upstream/UPSTREAM_STATE.env
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 14
+
+  keepalive:
+    name: Refresh the isolated automation keepalive branch
+    if: >-
+      ${{
+        github.event_name == 'schedule' &&
+        github.event.schedule == '43 3 1 * *'
+      }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Check out the default branch without stored credentials
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Commit one monthly marker only on automation/keepalive
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KEEPALIVE_BRANCH: automation/keepalive
+        run: |
+          set -euo pipefail
+          for tool in base64 git sort; do
+            command -v "$tool" >/dev/null
+          done
+          git check-ref-format "refs/heads/$KEEPALIVE_BRANCH" >/dev/null
+          basic_auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          auth_key=http.https://github.com/.extraheader
+          remote_output=$(git -c \
+            "$auth_key=AUTHORIZATION: basic $basic_auth" \
+            ls-remote --refs origin "refs/heads/$KEEPALIVE_BRANCH")
+          remote_commit=
+          if [[ -n "$remote_output" ]]; then
+            [[ $(wc -l <<< "$remote_output") -eq 1 ]]
+            read -r remote_commit remote_ref extra <<< "$remote_output"
+            [[ -z "${extra:-}" ]]
+            [[ "$remote_commit" =~ ^[0-9a-f]{40}$ ]]
+            [[ "$remote_ref" == "refs/heads/$KEEPALIVE_BRANCH" ]]
+            git -c "$auth_key=AUTHORIZATION: basic $basic_auth" fetch \
+              --no-tags --depth=1 origin "refs/heads/$KEEPALIVE_BRANCH"
+            git checkout --detach FETCH_HEAD
+          fi
+          mkdir -p automation
+          date -u +%Y-%m > automation/KEEPALIVE.txt
+          mapfile -t changed < <(
+            { git diff --name-only; git ls-files --others --exclude-standard; } |
+              sort -u
+          )
+          (( ${#changed[@]} <= 1 ))
+          should_push=0
+          if (( ${#changed[@]} == 1 )); then
+            [[ "${changed[0]}" == automation/KEEPALIVE.txt ]]
+            git config user.name github-actions[bot]
+            git config user.email \
+              41898282+github-actions[bot]@users.noreply.github.com
+            git add automation/KEEPALIVE.txt
+            git commit -m 'chore: refresh scheduled workflow keepalive [skip ci]'
+            should_push=1
+          elif [[ -z "$remote_commit" ]]; then
+            git config user.name github-actions[bot]
+            git config user.email \
+              41898282+github-actions[bot]@users.noreply.github.com
+            git commit --allow-empty \
+              -m 'chore: initialize scheduled workflow keepalive [skip ci]'
+            should_push=1
+          fi
+          if (( should_push == 1 )); then
+            keepalive_commit=$(git rev-parse HEAD)
+            git -c "$auth_key=AUTHORIZATION: basic $basic_auth" push \
+              --force-with-lease="refs/heads/$KEEPALIVE_BRANCH:$remote_commit" \
+              origin \
+              "HEAD:refs/heads/$KEEPALIVE_BRANCH"
+            pushed_output=$(git -c \
+              "$auth_key=AUTHORIZATION: basic $basic_auth" \
+              ls-remote --refs origin "refs/heads/$KEEPALIVE_BRANCH")
+            [[ $(wc -l <<< "$pushed_output") -eq 1 ]]
+            read -r pushed_commit pushed_ref pushed_extra <<< "$pushed_output"
+            [[ -z "${pushed_extra:-}" ]]
+            [[ "$pushed_commit" == "$keepalive_commit" ]]
+            [[ "$pushed_ref" == "refs/heads/$KEEPALIVE_BRANCH" ]]
+          fi
+
+  stable-prepare:
+    name: Rebuild and freeze stable candidate
+    needs: detect
+    if: >-
+      ${{
+        needs.detect.outputs.channel == 'stable' &&
+        needs.detect.outputs.reason != 'missing-stable-firmware-release' &&
+        needs.detect.outputs.reason != 'recover-locked-input-draft'
+      }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the exact detection revision
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Install stable refresh and UEFI validation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes build-essential curl file gawk gettext gzip ovmf python3 qemu-system-x86 rsync shellcheck squashfs-tools unzip zstd
+      - name: Build live candidate, freeze inputs, and rebuild offline
+        env:
+          STABLE_VERSION: ${{ needs.detect.outputs.stable_version }}
+        run: |
+          [[ "$STABLE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          make refresh-locks VERSION="$STABLE_VERSION"
+          make stage-inputs \
+            CANDIDATE="build/lock-refresh/$STABLE_VERSION" \
+            DESTINATION="build/locked-input-stage/$STABLE_VERSION"
+      - name: Transfer verified candidate and immutable inputs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: stable-candidate-${{ needs.detect.outputs.stable_version }}-run-${{ github.run_id }}
+          path: |
+            build/lock-refresh/${{ needs.detect.outputs.stable_version }}/
+            build/locked-input-stage/${{ needs.detect.outputs.stable_version }}/
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: true
+          retention-days: 14
+
+  stable-update:
+    name: Publish stable inputs and commit generated locks
+    needs:
+      - detect
+      - stable-prepare
+    if: >-
+      ${{
+        needs.detect.outputs.channel == 'stable' &&
+        needs.detect.outputs.reason != 'missing-stable-firmware-release' &&
+        needs.detect.outputs.reason != 'recover-locked-input-draft'
+      }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    permissions:
+      actions: read
+      contents: write
+    outputs:
+      commit: ${{ steps.commit.outputs.commit }}
+      version: ${{ needs.detect.outputs.stable_version }}
+    steps:
+      - name: Check out the candidate plan revision
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Download the stable candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: stable-candidate-${{ needs.detect.outputs.stable_version }}-run-${{ github.run_id }}
+          path: build/automation-download
+      - name: Restore candidate paths and install apply dependencies
+        env:
+          STABLE_VERSION: ${{ needs.detect.outputs.stable_version }}
+        run: |
+          set -euo pipefail
+          [[ "$STABLE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          mapfile -d '' candidates < <(
+            find build/automation-download -type f \
+              -path "*/lock-refresh/$STABLE_VERSION/locks/release.env" \
+              -print0
+          )
+          mapfile -d '' asset_manifests < <(
+            find build/automation-download -type f \
+              -path "*/locked-input-stage/$STABLE_VERSION/SHA256SUMS" \
+              -print0
+          )
+          [[ ${#candidates[@]} -eq 1 && ${#asset_manifests[@]} -eq 1 ]]
+          candidate=${candidates[0]}
+          assets=${asset_manifests[0]}
+          grep -Fqx "IMMORTALWRT_VERSION=$STABLE_VERSION" "$candidate"
+          grep -Fqx \
+            "LOCKED_INPUT_RELEASE_TAG=hmxf-openwrt-inputs-$STABLE_VERSION" \
+            "$candidate"
+          candidate_source=$(dirname -- "$(dirname -- "$candidate")")
+          asset_source=$(dirname -- "$assets")
+          [[ "$candidate_source" != "$asset_source" ]]
+          mkdir -p build/lock-refresh build/locked-input-stage
+          [[ ! -e "build/lock-refresh/$STABLE_VERSION" ]]
+          [[ ! -e "build/locked-input-stage/$STABLE_VERSION" ]]
+          mv -- "$candidate_source" "build/lock-refresh/$STABLE_VERSION"
+          mv -- "$asset_source" "build/locked-input-stage/$STABLE_VERSION"
+          sudo apt-get update
+          sudo apt-get install --yes build-essential curl file gawk gettext gzip ovmf python3 qemu-system-x86 rsync shellcheck squashfs-tools unzip zstd
+      - name: Prepare or verify the recoverable locked-input draft
+        id: input_release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STABLE_VERSION: ${{ needs.detect.outputs.stable_version }}
+        run: |
+          set -euo pipefail
+          source ./scripts/lib/github-release.sh
+          github_release_require_tools
+          release_tag="hmxf-openwrt-inputs-$STABLE_VERSION"
+          release_dir="$PWD/build/locked-input-stage/$STABLE_VERSION"
+          [[ $(find "$release_dir" -mindepth 1 -maxdepth 1 -type f | wc -l) -eq 7 ]]
+          [[ -z $(find "$release_dir" -mindepth 1 -maxdepth 1 ! -type f -print -quit) ]]
+          (
+            cd "$release_dir"
+            sha256sum --strict --quiet -c SHA256SUMS
+          )
+          release_json="$RUNNER_TEMP/locked-input-release.json"
+          if github_release_find_by_tag "$release_tag" "$release_json"; then
+            is_draft=$(jq -r '.draft' "$release_json")
+            [[ "$is_draft" =~ ^(true|false)$ ]]
+            expected_tag_commit=$(github_read_lightweight_tag_commit \
+              "$release_tag")
+            [[ "$expected_tag_commit" =~ ^[0-9a-f]{40}$ ]]
+            github_assert_release_metadata \
+              "$release_json" "$release_tag" "$is_draft" false
+            if [[ "$is_draft" == true ]]; then
+              github_replace_draft_assets \
+                "$release_json" "$release_tag" "$release_dir"
+              github_release_find_by_tag "$release_tag" "$release_json"
+              github_assert_release_metadata \
+                "$release_json" "$release_tag" true false
+            else
+              # A published immutable input Release cannot be rebound after
+              # main changes.  Reject legacy/mismatched objects before apply.
+              candidate_dir="$PWD/build/lock-refresh/$STABLE_VERSION"
+              diff -qr --no-dereference -- "$candidate_dir/locks" locks \
+                >/dev/null
+              for target in x86_64 rpi4 rpi5; do
+                cmp -s "$candidate_dir/configs/$target.config" \
+                  "configs/$target.config"
+              done
+              for tool in base64 git; do
+                command -v "$tool" >/dev/null
+              done
+              basic_auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | \
+                base64 -w0)
+              auth_key=http.https://github.com/.extraheader
+              git -c "$auth_key=AUTHORIZATION: basic $basic_auth" fetch \
+                --no-tags --depth=1 origin "refs/tags/$release_tag"
+              fetched_input_commit=$(git rev-parse FETCH_HEAD)
+              [[ "$fetched_input_commit" == "$expected_tag_commit" ]]
+              git diff --quiet "$fetched_input_commit" "$GITHUB_SHA" -- \
+                locks configs/x86_64.config configs/rpi4.config \
+                configs/rpi5.config || {
+                  printf '%s\n' \
+                    'error: published locked-input tag tree differs from the current formal plan' >&2
+                  exit 1
+                }
+            fi
+            github_verify_release_assets "$release_json" "$release_dir"
+          else
+            lookup_status=$?
+            (( lookup_status == 1 )) || exit "$lookup_status"
+            expected_tag_commit=$GITHUB_SHA
+            github_bind_unreleased_lightweight_tag_at_commit \
+              "$release_tag" "$GITHUB_SHA"
+            mapfile -d '' assets < <(
+              find "$release_dir" -mindepth 1 -maxdepth 1 -type f -print0 | sort -z
+            )
+            [[ ${#assets[@]} -eq 7 ]]
+            gh release create "$release_tag" "${assets[@]}" \
+              --repo "$GITHUB_REPOSITORY" --verify-tag --draft \
+              --latest=false --title "Locked build inputs $STABLE_VERSION" \
+              --notes "Automatically frozen after two matching stable candidate builds."
+            github_release_find_by_tag "$release_tag" "$release_json"
+            github_assert_release_metadata \
+              "$release_json" "$release_tag" true false
+            github_verify_release_assets "$release_json" "$release_dir"
+            is_draft=true
+          fi
+          github_require_lightweight_tag_at_commit \
+            "$release_tag" "$expected_tag_commit"
+          {
+            printf 'was_draft=%s\n' "$is_draft"
+            printf 'tag_commit=%s\n' "$expected_tag_commit"
+          } >> "$GITHUB_OUTPUT"
+      - name: Apply only generated stable locks and target configs
+        env:
+          STABLE_VERSION: ${{ needs.detect.outputs.stable_version }}
+        run: |
+          set -euo pipefail
+          make apply-locks CANDIDATE="build/lock-refresh/$STABLE_VERSION"
+          grep -Fqx "IMMORTALWRT_VERSION=$STABLE_VERSION" locks/release.env
+          grep -Fqx \
+            "LOCKED_INPUT_RELEASE_TAG=hmxf-openwrt-inputs-$STABLE_VERSION" \
+            locks/release.env
+          make test
+          mapfile -t changed < <(
+            { git diff --name-only; git ls-files --others --exclude-standard; } | sort -u
+          )
+          for path in "${changed[@]}"; do
+            case "$path" in
+              locks/* | configs/x86_64.config | configs/rpi4.config | configs/rpi5.config) ;;
+              *) printf 'error: stable automation changed forbidden path: %s\n' "$path" >&2; exit 1 ;;
+            esac
+          done
+      - name: Commit and push the stable lock revision
+        id: commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STABLE_VERSION: ${{ needs.detect.outputs.stable_version }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          EXPECTED_BASE: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          for tool in base64 git; do
+            command -v "$tool" >/dev/null
+          done
+          [[ "$EXPECTED_BASE" =~ ^[0-9a-f]{40}$ ]]
+          [[ -n "$DEFAULT_BRANCH" ]]
+          git check-ref-format "refs/heads/$DEFAULT_BRANCH" >/dev/null
+          [[ $(git rev-parse HEAD) == "$EXPECTED_BASE" ]]
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add locks configs/x86_64.config configs/rpi4.config configs/rpi5.config
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: lock ImmortalWrt $STABLE_VERSION [skip ci]"
+            basic_auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+            auth_key=http.https://github.com/.extraheader
+            remote_output=$(git -c \
+              "$auth_key=AUTHORIZATION: basic $basic_auth" \
+              ls-remote --refs origin "refs/heads/$DEFAULT_BRANCH")
+            [[ -n "$remote_output" ]]
+            [[ $(wc -l <<< "$remote_output") -eq 1 ]]
+            read -r remote_commit remote_ref extra <<< "$remote_output"
+            [[ -z "${extra:-}" ]]
+            [[ "$remote_commit" =~ ^[0-9a-f]{40}$ ]]
+            [[ "$remote_ref" == "refs/heads/$DEFAULT_BRANCH" ]]
+            [[ "$remote_commit" == "$EXPECTED_BASE" ]]
+            git -c "$auth_key=AUTHORIZATION: basic $basic_auth" push \
+              --force-with-lease="refs/heads/$DEFAULT_BRANCH:$EXPECTED_BASE" \
+              origin \
+              "HEAD:refs/heads/$DEFAULT_BRANCH"
+            pushed_commit=$(git rev-parse HEAD)
+            pushed_output=$(git -c \
+              "$auth_key=AUTHORIZATION: basic $basic_auth" \
+              ls-remote --refs origin "refs/heads/$DEFAULT_BRANCH")
+            [[ $(wc -l <<< "$pushed_output") -eq 1 ]]
+            read -r pushed_remote pushed_ref pushed_extra <<< "$pushed_output"
+            [[ -z "${pushed_extra:-}" ]]
+            [[ "$pushed_ref" == "refs/heads/$DEFAULT_BRANCH" ]]
+            [[ "$pushed_remote" == "$pushed_commit" ]]
+          fi
+          [[ -z $(git status --porcelain) ]]
+          commit=$(git rev-parse HEAD)
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
+          printf 'commit=%s\n' "$commit" >> "$GITHUB_OUTPUT"
+      - name: Bind the verified draft to the pushed commit and publish once
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STABLE_VERSION: ${{ needs.detect.outputs.stable_version }}
+          PUSHED_COMMIT: ${{ steps.commit.outputs.commit }}
+          RELEASE_WAS_DRAFT: ${{ steps.input_release.outputs.was_draft }}
+          EXPECTED_TAG_COMMIT: ${{ steps.input_release.outputs.tag_commit }}
+        run: |
+          set -euo pipefail
+          source ./scripts/lib/github-release.sh
+          github_release_require_tools
+          tag="hmxf-openwrt-inputs-$STABLE_VERSION"
+          release_dir="$PWD/build/locked-input-stage/$STABLE_VERSION"
+          release_json="$RUNNER_TEMP/locked-input-finalize.json"
+          github_release_find_by_tag "$tag" "$release_json"
+          is_draft=$(jq -r '.draft' "$release_json")
+          [[ "$is_draft" =~ ^(true|false)$ ]]
+          github_assert_release_metadata "$release_json" "$tag" \
+            "$is_draft" false
+          github_verify_release_assets "$release_json" "$release_dir"
+          [[ "$RELEASE_WAS_DRAFT" =~ ^(true|false)$ ]]
+          [[ "$EXPECTED_TAG_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$is_draft" == "$RELEASE_WAS_DRAFT" ]]
+          if [[ "$RELEASE_WAS_DRAFT" == true ]]; then
+            github_require_lightweight_tag_at_commit \
+              "$tag" "$EXPECTED_TAG_COMMIT"
+            github_rebind_draft_tag_at_commit \
+              "$release_json" "$tag" "$PUSHED_COMMIT"
+            github_publish_draft_and_require_immutable \
+              "$tag" false false "$release_dir"
+            final_tag_commit=$PUSHED_COMMIT
+          else
+            # An immutable published input may legitimately point to an older
+            # plan commit whose formal locks/configs match the current tree.
+            final_tag_commit=$EXPECTED_TAG_COMMIT
+          fi
+          github_release_find_by_tag "$tag" "$release_json"
+          github_assert_release_metadata "$release_json" "$tag" false false
+          github_require_lightweight_tag_at_commit "$tag" "$final_tag_commit"
+          github_verify_release_assets "$release_json" "$release_dir"
+
+  stable-input-recovery:
+    name: Recover a verified locked-input draft after a completed main update
+    needs: detect
+    if: ${{ needs.detect.outputs.reason == 'recover-locked-input-draft' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Verify current locks against every draft byte and publish once
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STABLE_VERSION: ${{ needs.detect.outputs.stable_version }}
+        run: |
+          set -euo pipefail
+          source ./scripts/lib/github-release.sh
+          github_release_require_tools
+          tag="hmxf-openwrt-inputs-$STABLE_VERSION"
+          release_json="$RUNNER_TEMP/locked-input-recovery.json"
+          release_dir="$RUNNER_TEMP/locked-input-recovery"
+          mkdir -p "$release_dir"
+          github_release_find_by_tag "$tag" "$release_json"
+          github_assert_release_metadata "$release_json" "$tag" true false
+          [[ $(jq '.assets | length' "$release_json") -eq 7 ]]
+          jq -er '.assets[] | [.id, .name] | @tsv' "$release_json" |
+            while IFS=$'\t' read -r asset_id asset_name; do
+              [[ "$asset_id" =~ ^[1-9][0-9]*$ ]]
+              [[ "$asset_name" =~ ^[A-Za-z0-9][A-Za-z0-9+._-]*$ ]]
+              gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+                -H 'Accept: application/octet-stream' \
+                "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" \
+                > "$release_dir/$asset_name"
+            done
+          github_verify_release_assets "$release_json" "$release_dir"
+          while IFS='|' read -r first _ _ _ _ file digest vermagic bytes extra; do
+            [[ -z "${extra:-}" ]]
+            [[ "${first:0:1}" == '#' ]] && continue
+            [[ -n "$first" && -n "$vermagic" ]]
+            [[ $(sha256sum "$release_dir/$file" | awk '{print $1}') == "$digest" ]]
+            [[ $(stat -c %s "$release_dir/$file") == "$bytes" ]]
+          done < locks/targets.tsv
+          while IFS='|' read -r first file digest bytes tree_digest extra; do
+            [[ -z "${extra:-}" ]]
+            [[ "${first:0:1}" == '#' ]] && continue
+            [[ -n "$first" && -n "$tree_digest" ]]
+            [[ $(sha256sum "$release_dir/$file" | awk '{print $1}') == "$digest" ]]
+            [[ $(stat -c %s "$release_dir/$file") == "$bytes" ]]
+          done < locks/package-snapshots.tsv
+          github_rebind_draft_tag_at_commit "$release_json" "$tag" "$GITHUB_SHA"
+          github_publish_draft_and_require_immutable \
+            "$tag" false false "$release_dir"
+          github_release_find_by_tag "$tag" "$release_json"
+          github_assert_release_metadata "$release_json" "$tag" false false
+          github_require_lightweight_tag_at_commit "$tag" "$GITHUB_SHA"
+          github_verify_release_assets "$release_json" "$release_dir"
+
+  stable-ref:
+    name: Resolve the canonical stable source revision
+    needs:
+      - detect
+      - stable-update
+      - stable-input-recovery
+    if: >-
+      ${{
+        !cancelled() &&
+        needs.detect.result == 'success' &&
+        needs.detect.outputs.channel == 'stable' &&
+        (
+          needs.detect.outputs.reason == 'missing-stable-firmware-release' ||
+          needs.stable-input-recovery.result == 'success' ||
+          needs.stable-update.result == 'success'
+        )
+      }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    outputs:
+      commit: ${{ steps.resolve.outputs.commit }}
+    steps:
+      - name: Select current locked plan or newly committed locks
+        id: resolve
+        env:
+          REASON: ${{ needs.detect.outputs.reason }}
+          CURRENT_COMMIT: ${{ github.sha }}
+          UPDATED_COMMIT: ${{ needs.stable-update.outputs.commit }}
+        run: |
+          set -euo pipefail
+          if [[ "$REASON" == missing-stable-firmware-release ]]; then
+            commit=$CURRENT_COMMIT
+          elif [[ "$REASON" == recover-locked-input-draft ]]; then
+            commit=$CURRENT_COMMIT
+          else
+            commit=$UPDATED_COMMIT
+          fi
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
+          printf 'commit=%s\n' "$commit" >> "$GITHUB_OUTPUT"
+
+  stable-firmware:
+    name: Canonical firmware from the resolved stable commit
+    needs:
+      - detect
+      - stable-ref
+    if: ${{ needs.stable-ref.result == 'success' }}
+    uses: ./.github/workflows/build.yml
+    with:
+      source_ref: ${{ needs.stable-ref.outputs.commit }}
+    permissions:
+      contents: read
+
+  stable-release:
+    name: Publish stable installation and upgrade images
+    needs:
+      - detect
+      - stable-ref
+      - stable-firmware
+    if: ${{ needs.stable-firmware.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Check out the exact canonical build revision
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ needs.stable-ref.outputs.commit }}
+          persist-credentials: false
+      - name: Download all six canonical artifact directories
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: immortalwrt-${{ needs.detect.outputs.stable_version }}-*-run-${{ github.run_id }}
+          path: build/release-download
+      - name: Normalize and stage user-facing firmware assets
+        env:
+          STABLE_VERSION: ${{ needs.detect.outputs.stable_version }}
+        run: |
+          set -euo pipefail
+          root="$PWD/build/release-input/$STABLE_VERSION"
+          mapfile -d '' downloaded < <(
+            find build/release-download -mindepth 1 -maxdepth 1 -type d \
+              -print0
+          )
+          [[ ${#downloaded[@]} -eq 6 ]]
+          for target in x86_64 rpi4 rpi5; do
+            for preset in minimal full; do
+              name="immortalwrt-$STABLE_VERSION-$target-$preset-run-$GITHUB_RUN_ID"
+              source_dir="$PWD/build/release-download/$name"
+              [[ -d "$source_dir" && ! -L "$source_dir" ]]
+              mkdir -p "$root/$target"
+              mv -- "$source_dir" "$root/$target/$preset"
+            done
+          done
+          [[ -z $(find build/release-download -mindepth 1 -print -quit) ]]
+          ./scripts/inputs/stage-firmware-release.sh stable \
+            "$root" "$PWD/build/release-assets/firmware-$STABLE_VERSION" \
+            "$STABLE_VERSION"
+      - name: Create a verified immutable stable firmware Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STABLE_VERSION: ${{ needs.detect.outputs.stable_version }}
+          STABLE_COMMIT: ${{ needs.stable-ref.outputs.commit }}
+        run: |
+          set -euo pipefail
+          source ./scripts/lib/github-release.sh
+          github_release_require_tools
+          [[ "$STABLE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          tag="firmware-$STABLE_VERSION"
+          release_dir="$PWD/build/release-assets/$tag"
+          [[ $(find "$release_dir" -mindepth 1 -maxdepth 1 -type f | \
+            wc -l) -eq 18 ]]
+          [[ -z $(find "$release_dir" -mindepth 1 -maxdepth 1 ! -type f \
+            -print -quit) ]]
+          release_json="$RUNNER_TEMP/stable-firmware-release.json"
+          if github_release_find_by_tag "$tag" "$release_json"; then
+            is_draft=$(jq -r '.draft' "$release_json")
+            [[ "$is_draft" =~ ^(true|false)$ ]]
+            github_assert_release_metadata \
+              "$release_json" "$tag" "$is_draft" false
+            if [[ "$is_draft" == true ]]; then
+              github_rebind_draft_tag_at_commit \
+                "$release_json" "$tag" "$STABLE_COMMIT"
+              github_replace_draft_assets "$release_json" "$tag" "$release_dir"
+              github_release_find_by_tag "$tag" "$release_json"
+              github_assert_release_metadata "$release_json" "$tag" true false
+            fi
+            github_require_lightweight_tag_at_commit "$tag" "$STABLE_COMMIT"
+            github_verify_release_assets "$release_json" "$release_dir"
+          else
+            lookup_status=$?
+            (( lookup_status == 1 )) || exit "$lookup_status"
+            github_bind_unreleased_lightweight_tag_at_commit \
+              "$tag" "$STABLE_COMMIT"
+            mapfile -d '' assets < <(
+              find "$release_dir" -mindepth 1 -maxdepth 1 -type f -print0 | sort -z
+            )
+            [[ ${#assets[@]} -eq 18 ]]
+            gh release create "$tag" "${assets[@]}" --repo "$GITHUB_REPOSITORY" \
+              --verify-tag --draft --latest=false \
+              --title "hmxf-OpenWRT $STABLE_VERSION" \
+              --notes-file "$release_dir/RELEASE_NOTES.md"
+            github_release_find_by_tag "$tag" "$release_json"
+            github_assert_release_metadata "$release_json" "$tag" true false
+            github_verify_release_assets "$release_json" "$release_dir"
+            is_draft=true
+          fi
+          if [[ "$is_draft" == true ]]; then
+            github_require_lightweight_tag_at_commit "$tag" "$STABLE_COMMIT"
+            github_publish_draft_and_require_immutable \
+              "$tag" false true "$release_dir"
+          fi
+          github_release_find_by_tag "$tag" "$release_json"
+          github_assert_release_metadata "$release_json" "$tag" false false
+          github_require_lightweight_tag_at_commit "$tag" "$STABLE_COMMIT"
+          latest_json="$RUNNER_TEMP/latest-stable-release.json"
+          github_api_get_optional \
+            "repos/$GITHUB_REPOSITORY/releases/latest" "$latest_json"
+          jq -e --arg tag "$tag" \
+            '.tag_name == $tag and .draft == false and .prerelease == false' \
+            "$latest_json" >/dev/null
+
+  nightly-capture:
+    name: Capture one immutable nightly package universe
+    needs: detect
+    if: ${{ needs.detect.outputs.channel == 'nightly' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      fingerprint: ${{ steps.identity.outputs.fingerprint }}
+    steps:
+      - name: Check out the current nightly build plan
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Download the classified upstream state
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: upstream-state-run-${{ github.run_id }}
+          path: build/upstream
+      - name: Install ImageBuilder and UEFI validation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes build-essential curl file gawk gettext gzip ovmf python3 qemu-system-x86 rsync shellcheck squashfs-tools unzip zstd
+      - name: Resolve live packages and freeze the final nightly inputs
+        id: identity
+        env:
+          UPSTREAM_FINGERPRINT: ${{ needs.detect.outputs.fingerprint }}
+          DOWNLOAD_DIR: ${{ runner.temp }}/nightly/imagebuilders
+          PACKAGE_CACHE_ROOT: ${{ runner.temp }}/nightly/packages
+        run: |
+          set -euo pipefail
+          [[ "$UPSTREAM_FINGERPRINT" =~ ^[0-9a-f]{64}$ ]]
+          grep -Fqx "SNAPSHOT_FINGERPRINT=$UPSTREAM_FINGERPRINT" \
+            build/upstream/UPSTREAM_STATE.env
+          ./scripts/build/build-nightly.sh \
+            build/upstream/UPSTREAM_STATE.env capture
+          pointer="build/nightly/$UPSTREAM_FINGERPRINT/NIGHTLY_BUILD_POINTER.env"
+          [[ -f "$pointer" && ! -L "$pointer" && \
+             $(wc -l < "$pointer") -eq 6 ]]
+          value() {
+            local key=$1
+            awk -F= -v wanted="$key" '
+              $1 == wanted { count += 1; value = $2 }
+              END { if (count == 1) print value; else exit 1 }
+            ' "$pointer"
+          }
+          schema=$(value NIGHTLY_BUILD_SCHEMA)
+          recorded_upstream=$(value UPSTREAM_FINGERPRINT)
+          plan_digest=$(value PLAN_INPUTS_SHA256)
+          snapshots_digest=$(value PACKAGE_SNAPSHOTS_SHA256)
+          snapshot_lock_digest=$(value PACKAGE_SNAPSHOT_LOCK_SHA256)
+          fingerprint=$(value NIGHTLY_FINGERPRINT)
+          [[ "$schema" == 1 && \
+             "$recorded_upstream" == "$UPSTREAM_FINGERPRINT" && \
+             "$plan_digest" =~ ^[0-9a-f]{64}$ && \
+             "$snapshots_digest" =~ ^[0-9a-f]{64}$ && \
+             "$snapshot_lock_digest" =~ ^[0-9a-f]{64}$ && \
+             "$fingerprint" =~ ^[0-9a-f]{64}$ && \
+             "$fingerprint" != "$UPSTREAM_FINGERPRINT" ]]
+          calculated=$(printf 'nightly-build-v1\n%s\n%s\n%s\n' \
+            "$UPSTREAM_FINGERPRINT" "$plan_digest" "$snapshots_digest" | \
+            sha256sum | awk '{ print $1 }')
+          [[ "$calculated" == "$fingerprint" ]]
+          final_root="$PWD/build/nightly/$fingerprint"
+          [[ -d "$final_root/context" && ! -L "$final_root" ]]
+          cmp -s "$pointer" "$final_root/NIGHTLY_BUILD.env"
+          [[ $(sha256sum "$final_root/context/PLAN_INPUTS.sha256" | \
+            awk '{ print $1 }') == "$plan_digest" ]]
+          [[ $(sha256sum \
+            "$final_root/context/locks/package-snapshots.tsv" | \
+            awk '{ print $1 }') == "$snapshot_lock_digest" ]]
+          [[ $(./scripts/inputs/nightly-build-identity.sh content \
+            "$final_root/context/locks/package-snapshots.tsv") == \
+            "$snapshots_digest" ]]
+          [[ -z $(find "$final_root" -mindepth 1 \
+            ! -type f ! -type d -print -quit) ]]
+          (
+            cd "$final_root/context"
+            sha256sum --strict --quiet -c CONTEXT.sha256
+          )
+          printf 'fingerprint=%s\n' "$fingerprint" >> "$GITHUB_OUTPUT"
+          printf -- "- Final nightly fingerprint: \`%s\`\n" "$fingerprint" \
+            >> "$GITHUB_STEP_SUMMARY"
+      - name: Transfer the frozen context, ImageBuilders, and package snapshots
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nightly-capture-run-${{ github.run_id }}
+          path: |
+            build/nightly/${{ needs.detect.outputs.fingerprint }}/NIGHTLY_BUILD_POINTER.env
+            build/nightly/${{ steps.identity.outputs.fingerprint }}/
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: true
+          retention-days: 14
+
+  nightly-build:
+    name: Rebuild ${{ matrix.target }} from frozen nightly inputs
+    needs:
+      - detect
+      - nightly-capture
+    if: ${{ needs.nightly-capture.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    permissions:
+      actions: read
+      contents: read
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        target:
+          - x86_64
+          - rpi4
+          - rpi5
+    steps:
+      - name: Check out the exact nightly build plan
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Download the classified state
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: upstream-state-run-${{ github.run_id }}
+          path: build/upstream
+      - name: Download the immutable nightly capture
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: nightly-capture-run-${{ github.run_id }}
+          path: build/nightly
+      - name: Install ImageBuilder and UEFI validation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes build-essential curl file gawk gettext gzip ovmf python3 qemu-system-x86 rsync shellcheck squashfs-tools unzip zstd
+      - name: Rebuild full and minimal without live package repositories
+        env:
+          FINAL_FINGERPRINT: ${{ needs.nightly-capture.outputs.fingerprint }}
+          UPSTREAM_FINGERPRINT: ${{ needs.detect.outputs.fingerprint }}
+        run: |
+          set -euo pipefail
+          [[ "$FINAL_FINGERPRINT" =~ ^[0-9a-f]{64}$ ]]
+          grep -Fqx "UPSTREAM_FINGERPRINT=$UPSTREAM_FINGERPRINT" \
+            "build/nightly/$FINAL_FINGERPRINT/NIGHTLY_BUILD.env"
+          grep -Fqx "NIGHTLY_FINGERPRINT=$FINAL_FINGERPRINT" \
+            "build/nightly/$FINAL_FINGERPRINT/NIGHTLY_BUILD.env"
+          ./scripts/build/build-nightly.sh \
+            build/upstream/UPSTREAM_STATE.env rebuild "${{ matrix.target }}"
+          output="build/nightly/$FINAL_FINGERPRINT/out"
+          [[ -d "$output/SNAPSHOT/${{ matrix.target }}/full" ]]
+          [[ -d "$output/SNAPSHOT/${{ matrix.target }}/minimal" ]]
+          [[ $(find "$output/SNAPSHOT" -mindepth 1 -maxdepth 1 -type d | \
+            wc -l) -eq 1 ]]
+      - name: Transfer one target plus identical verified provenance
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nightly-${{ needs.nightly-capture.outputs.fingerprint }}-${{ matrix.target }}-run-${{ github.run_id }}
+          path: build/nightly/${{ needs.nightly-capture.outputs.fingerprint }}/out/
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: true
+          retention-days: 14
+
+  nightly-stage:
+    name: Assemble the verified nightly Release transaction
+    needs:
+      - detect
+      - nightly-capture
+      - nightly-build
+    if: ${{ needs.nightly-build.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Check out trusted release staging code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Merge all three disjoint target artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: nightly-${{ needs.nightly-capture.outputs.fingerprint }}-*-run-${{ github.run_id }}
+          path: build/nightly-download
+      - name: Restore the frozen durable-input capture for publication
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: nightly-capture-run-${{ github.run_id }}
+          path: build/nightly-capture
+      - name: Strictly stage all nightly installation and upgrade assets
+        env:
+          FINAL_FINGERPRINT: ${{ needs.nightly-capture.outputs.fingerprint }}
+          UPSTREAM_FINGERPRINT: ${{ needs.detect.outputs.fingerprint }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2016
+          [[ "$FINAL_FINGERPRINT" =~ ^[0-9a-f]{64}$ ]]
+          out="$PWD/build/nightly/$FINAL_FINGERPRINT/out"
+          mkdir -p "$out/SNAPSHOT"
+          captured="$PWD/build/nightly-capture/$FINAL_FINGERPRINT"
+          [[ -d "$captured/context" && -d "$captured/imagebuilders" && \
+             -d "$captured/package-snapshot-bundles" ]]
+          [[ -z $(find "$captured/context" "$captured/imagebuilders" \
+            "$captured/package-snapshot-bundles" -mindepth 1 \
+            ! -type f ! -type d -print -quit) ]]
+          cp -a -- "$captured/context" \
+            "$PWD/build/nightly/$FINAL_FINGERPRINT/context"
+          cp -a -- "$captured/imagebuilders" \
+            "$PWD/build/nightly/$FINAL_FINGERPRINT/imagebuilders"
+          cp -a -- "$captured/package-snapshot-bundles" \
+            "$PWD/build/nightly/$FINAL_FINGERPRINT/package-snapshot-bundles"
+          cp -- "$captured/NIGHTLY_BUILD_CONTEXT.tar" \
+            "$PWD/build/nightly/$FINAL_FINGERPRINT/NIGHTLY_BUILD_CONTEXT.tar"
+          provenance=(
+            UPSTREAM_STATE.env NIGHTLY_BUILD.env NIGHTLY_RELEASE.env
+            NIGHTLY_TARGETS.tsv NIGHTLY_FEEDS.tsv
+            NIGHTLY_PACKAGE_SNAPSHOTS.tsv PLAN_INPUTS.sha256
+            PLAN_INPUT_REVISION.txt NIGHTLY_CONTEXT.sha256
+          )
+          mapfile -d '' downloaded < <(
+            find build/nightly-download -mindepth 1 -maxdepth 1 -type d \
+              -print0
+          )
+          [[ ${#downloaded[@]} -eq 3 ]]
+          reference=
+          for target in x86_64 rpi4 rpi5; do
+            name="nightly-$FINAL_FINGERPRINT-$target-run-$GITHUB_RUN_ID"
+            source_dir="$PWD/build/nightly-download/$name"
+            [[ -d "$source_dir/SNAPSHOT/$target" && ! -L "$source_dir" ]]
+            [[ $(find "$source_dir/SNAPSHOT" -mindepth 1 -maxdepth 1 \
+              -type d | wc -l) -eq 1 ]]
+            [[ -z $(find "$source_dir/SNAPSHOT" -mindepth 1 -maxdepth 1 \
+              ! -type d -print -quit) ]]
+            [[ $(find "$source_dir" -mindepth 1 -maxdepth 1 -type f | \
+              wc -l) -eq 9 ]]
+            [[ $(find "$source_dir" -mindepth 1 -maxdepth 1 -type d | \
+              wc -l) -eq 1 ]]
+            [[ -z $(find "$source_dir" -mindepth 1 -maxdepth 1 \
+              ! -type f ! -type d -print -quit) ]]
+            for file in "${provenance[@]}"; do
+              [[ -f "$source_dir/$file" && ! -L "$source_dir/$file" ]]
+              if [[ -z "$reference" ]]; then
+                cp -- "$source_dir/$file" "$out/$file"
+              else
+                cmp -s "$reference/$file" "$source_dir/$file"
+              fi
+            done
+            [[ -n "$reference" ]] || reference=$source_dir
+            mv -- "$source_dir/SNAPSHOT/$target" "$out/SNAPSHOT/$target"
+          done
+          mapfile -d '' targets < <(
+            find "$out/SNAPSHOT" -mindepth 1 -maxdepth 1 -type d -print0
+          )
+          [[ ${#targets[@]} -eq 3 ]]
+          for target in x86_64 rpi4 rpi5; do
+            [[ -d "$out/SNAPSHOT/$target/full" && \
+               -d "$out/SNAPSHOT/$target/minimal" ]]
+          done
+          grep -Fqx "UPSTREAM_FINGERPRINT=$UPSTREAM_FINGERPRINT" \
+            "$out/NIGHTLY_BUILD.env"
+          grep -Fqx "NIGHTLY_FINGERPRINT=$FINAL_FINGERPRINT" \
+            "$out/NIGHTLY_BUILD.env"
+          tag="nightly-$FINAL_FINGERPRINT"
+          ./scripts/inputs/stage-firmware-release.sh nightly \
+            "$out/SNAPSHOT" "$PWD/build/release-assets/$tag" \
+            "$FINAL_FINGERPRINT"
+          release_dir="$PWD/build/release-assets/$tag"
+          [[ $(find "$release_dir" -mindepth 1 -maxdepth 1 -type f | \
+            wc -l) -eq 33 ]]
+          [[ -z $(find "$release_dir" -mindepth 1 -maxdepth 1 ! -type f \
+            -print -quit) ]]
+      - name: Transfer the exact staged nightly release
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nightly-release-candidate-run-${{ github.run_id }}
+          path: build/release-assets/nightly-${{ needs.nightly-capture.outputs.fingerprint }}/
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: true
+          retention-days: 14
+
+  nightly-publish:
+    name: Publish the verified immutable nightly prerelease
+    needs:
+      - detect
+      - nightly-capture
+      - nightly-stage
+    if: ${{ needs.nightly-stage.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Check out only the trusted publication helper
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Download the exact staged nightly release
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: nightly-release-candidate-run-${{ github.run_id }}
+          path: build/release-assets/nightly-${{ needs.nightly-capture.outputs.fingerprint }}
+      - name: Publish only after tag, status, and remote-byte verification
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FINGERPRINT: ${{ needs.nightly-capture.outputs.fingerprint }}
+          UPSTREAM_FINGERPRINT: ${{ needs.detect.outputs.fingerprint }}
+          RELEASE_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          source ./scripts/lib/github-release.sh
+          github_release_require_tools
+          [[ "$FINGERPRINT" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$RELEASE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          tag="nightly-$FINGERPRINT"
+          release_dir="$PWD/build/release-assets/$tag"
+          [[ $(find "$release_dir" -mindepth 1 -maxdepth 1 -type f | \
+            wc -l) -eq 33 ]]
+          [[ -z $(find "$release_dir" -mindepth 1 -maxdepth 1 ! -type f \
+            -print -quit) ]]
+          grep -Fqx "UPSTREAM_FINGERPRINT=$UPSTREAM_FINGERPRINT" \
+            "$release_dir/NIGHTLY_BUILD.env"
+          grep -Fqx "NIGHTLY_FINGERPRINT=$FINGERPRINT" \
+            "$release_dir/NIGHTLY_BUILD.env"
+          release_json="$RUNNER_TEMP/nightly-release.json"
+          if github_release_find_by_tag "$tag" "$release_json"; then
+            is_draft=$(jq -r '.draft' "$release_json")
+            [[ "$is_draft" =~ ^(true|false)$ ]]
+            github_assert_release_metadata \
+              "$release_json" "$tag" "$is_draft" true
+            if [[ "$is_draft" == true ]]; then
+              github_rebind_draft_tag_at_commit \
+                "$release_json" "$tag" "$RELEASE_COMMIT"
+              github_replace_draft_assets "$release_json" "$tag" "$release_dir"
+              github_release_find_by_tag "$tag" "$release_json"
+              github_assert_release_metadata "$release_json" "$tag" true true
+            fi
+            github_require_lightweight_tag_at_commit "$tag" "$RELEASE_COMMIT"
+            github_verify_release_assets "$release_json" "$release_dir"
+          else
+            lookup_status=$?
+            (( lookup_status == 1 )) || exit "$lookup_status"
+            github_bind_unreleased_lightweight_tag_at_commit \
+              "$tag" "$RELEASE_COMMIT"
+            mapfile -d '' assets < <(
+              find "$release_dir" -mindepth 1 -maxdepth 1 -type f -print0 | sort -z
+            )
+            [[ ${#assets[@]} -eq 33 ]]
+            gh release create "$tag" "${assets[@]}" --repo "$GITHUB_REPOSITORY" \
+              --verify-tag --draft --prerelease --latest=false \
+              --title "hmxf-OpenWRT nightly ${FINGERPRINT:0:16}" \
+              --notes-file "$release_dir/RELEASE_NOTES.md"
+            github_release_find_by_tag "$tag" "$release_json"
+            github_assert_release_metadata "$release_json" "$tag" true true
+            github_verify_release_assets "$release_json" "$release_dir"
+            is_draft=true
+          fi
+          if [[ "$is_draft" == true ]]; then
+            github_require_lightweight_tag_at_commit "$tag" "$RELEASE_COMMIT"
+            github_publish_draft_and_require_immutable \
+              "$tag" true false "$release_dir"
+          fi
+          github_release_find_by_tag "$tag" "$release_json"
+          github_assert_release_metadata "$release_json" "$tag" false true
+          github_require_lightweight_tag_at_commit "$tag" "$RELEASE_COMMIT"

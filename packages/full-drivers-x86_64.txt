@@ -1,0 +1,16 @@
+# x86-only or x86-published Ethernet drivers.
+kmod-amazon-ena
+kmod-amd-xgbe
+kmod-dwmac-intel
+kmod-dwmac-motorcomm
+kmod-hinic
+kmod-igbvf
+
+# Keep ImmortalWrt x86's vendor Realtek family.  Never combine this set with
+# kmod-r8169 or the upstream USB rtl8152 package.
+kmod-r8101
+kmod-r8168
+kmod-r8125
+kmod-r8126
+kmod-r8127
+kmod-usb-net-rtl8152-vendor

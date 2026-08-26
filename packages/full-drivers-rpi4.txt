@@ -1,0 +1,4 @@
+# Keep the Raspberry Pi profile's upstream Realtek family.  Vendor r81xx and
+# rtl8152-vendor packages overlap these modules and are intentionally excluded.
+kmod-r8169
+kmod-usb-net-rtl8152

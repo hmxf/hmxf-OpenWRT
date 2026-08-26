@@ -1,0 +1,4 @@
+# name|target|subtarget|profile|package_arch|imagebuilder_filename|sha256|kernel_vermagic|bytes
+x86_64|x86|64|generic|x86_64|immortalwrt-imagebuilder-25.12.1-x86-64.Linux-x86_64.tar.zst|637c8d1cd5f3b1959eb42a0c8bb2e791687080b022a8315784e8f9b8b5238157|0413601b1c3f0490e17f340fe09229ea|43819655
+rpi4|bcm27xx|bcm2711|rpi-4|aarch64_cortex-a72|immortalwrt-imagebuilder-25.12.1-bcm27xx-bcm2711.Linux-x86_64.tar.zst|ef6498e183a116c274a3177c500c84759eddbc67eeae786320515198a77c3e1a|8df305fef179c09d6e1e1dc384023cbb|44332334
+rpi5|bcm27xx|bcm2712|rpi-5|aarch64_cortex-a76|immortalwrt-imagebuilder-25.12.1-bcm27xx-bcm2712.Linux-x86_64.tar.zst|7372c836876969d01da1eb85455b06f07a2f68ea0ebfb89c404fdc7e18178416|9614b8338b7dea1d5b70340f90254007|45497652

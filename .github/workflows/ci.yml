@@ -1,0 +1,29 @@
+name: Continuous integration
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event_name == 'workflow_dispatch' && github.run_id || github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: Repository tests
+    uses: ./.github/workflows/tests.yml
+    permissions:
+      contents: read
+
+  firmware:
+    name: Production firmware
+    needs: tests
+    uses: ./.github/workflows/build.yml
+    permissions:
+      contents: read

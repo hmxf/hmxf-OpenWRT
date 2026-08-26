@@ -1,0 +1,13 @@
+# Common to minimal and full.  Applications and optional hardware drivers stay
+# outside this list so both presets retain the same small, auditable control
+# plane.
+apk-openssl
+ca-bundle
+luci
+luci-ssl-openssl
+luci-i18n-base-zh-cn
+owut
+luci-app-attendedsysupgrade
+luci-i18n-attendedsysupgrade-zh-cn
+luci-app-package-manager
+luci-i18n-package-manager-zh-cn

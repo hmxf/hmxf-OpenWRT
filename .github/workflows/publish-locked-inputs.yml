@@ -1,0 +1,371 @@
+name: Publish reviewed locked build inputs
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_run_id:
+        description: Successful refresh workflow run ID containing the reviewed candidate
+        required: true
+        type: string
+      candidate_artifact_id:
+        description: Exact Artifact ID shown by the reviewed refresh attempt
+        required: true
+        type: string
+      candidate_artifact_sha256:
+        description: Exact lowercase 64-character Artifact SHA-256 shown by that attempt
+        required: true
+        type: string
+      expected_version:
+        description: Exact reviewed release version (for example, 25.12.1)
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: hmxf-openwrt-release-publication
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - name: Check out the reviewed publication tooling
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Download the reviewed candidate artifact
+        id: candidate
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+          CANDIDATE_ARTIFACT_ID: ${{ inputs.candidate_artifact_id }}
+          CANDIDATE_ARTIFACT_SHA256: ${{ inputs.candidate_artifact_sha256 }}
+          EXPECTED_VERSION: ${{ inputs.expected_version }}
+          CURRENT_WORKFLOW_SHA: ${{ github.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          REPOSITORY_ID: ${{ github.repository_id }}
+        run: |
+          set -euo pipefail
+          for tool in cmp find gh jq python3 sha256sum sort stat; do
+            command -v "$tool" >/dev/null
+          done
+          [[ "$CANDIDATE_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$CANDIDATE_ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$CANDIDATE_ARTIFACT_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$EXPECTED_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$CURRENT_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$REPOSITORY_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ -n "$DEFAULT_BRANCH" ]]
+          refresh_workflow_id=$(gh api \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/refresh-locks.yml" \
+            --jq '.id')
+          [[ "$refresh_workflow_id" =~ ^[1-9][0-9]*$ ]]
+          run_file="$RUNNER_TEMP/reviewed-candidate-run.json"
+          gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$CANDIDATE_RUN_ID" \
+            > "$run_file"
+          jq -e --arg branch "$DEFAULT_BRANCH" --arg sha "$CURRENT_WORKFLOW_SHA" \
+            --argjson run_id "$CANDIDATE_RUN_ID" \
+            --argjson workflow_id "$refresh_workflow_id" \
+            --argjson repository_id "$REPOSITORY_ID" '
+            .id == $run_id and
+            .workflow_id == $workflow_id and
+            .event == "workflow_dispatch" and
+            .status == "completed" and .conclusion == "success" and
+            .head_branch == $branch and .head_sha == $sha and
+            .repository.id == $repository_id and
+            .head_repository.id == $repository_id
+          ' "$run_file" >/dev/null
+          candidate_sha=$(jq -er '.head_sha' "$run_file")
+          [[ "$candidate_sha" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$candidate_sha" == "$CURRENT_WORKFLOW_SHA" ]] || {
+            printf '%s\n' \
+              'error: publish must be dispatched from the exact protected-main commit that produced the candidate' >&2
+            exit 1
+          }
+
+          artifact_name="immortalwrt-lock-candidate-$EXPECTED_VERSION-run-$CANDIDATE_RUN_ID"
+          artifact_file="$RUNNER_TEMP/reviewed-candidate-artifact.json"
+          gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/actions/artifacts/$CANDIDATE_ARTIFACT_ID" \
+            > "$artifact_file"
+          jq -e --arg name "$artifact_name" --arg sha "$candidate_sha" \
+            --arg digest "sha256:$CANDIDATE_ARTIFACT_SHA256" \
+            --arg branch "$DEFAULT_BRANCH" \
+            --argjson artifact_id "$CANDIDATE_ARTIFACT_ID" \
+            --argjson run_id "$CANDIDATE_RUN_ID" \
+            --argjson repository_id "$REPOSITORY_ID" '
+            .id == $artifact_id and .name == $name and
+            (.size_in_bytes | type == "number" and . > 0) and
+            .expired == false and .digest == $digest and
+            .workflow_run.id == $run_id and
+            .workflow_run.repository_id == $repository_id and
+            .workflow_run.head_repository_id == $repository_id and
+            .workflow_run.head_branch == $branch and
+            .workflow_run.head_sha == $sha
+          ' "$artifact_file" >/dev/null
+
+          artifact_pages="$RUNNER_TEMP/reviewed-candidate-artifacts.json"
+          gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+            --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$CANDIDATE_RUN_ID/artifacts?per_page=100&name=$artifact_name" \
+            > "$artifact_pages"
+          jq -e --arg name "$artifact_name" \
+            --argjson artifact_id "$CANDIDATE_ARTIFACT_ID" '
+            [.[].artifacts[] | select(.name == $name)] as $matches |
+            ($matches | length) == 1 and $matches[0].id == $artifact_id
+          ' "$artifact_pages" >/dev/null
+
+          archive="$RUNNER_TEMP/reviewed-candidate-$CANDIDATE_ARTIFACT_ID.zip"
+          [[ ! -e "$archive" && ! -L "$archive" ]]
+          gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+            -H 'Accept: application/octet-stream' \
+            "repos/$GITHUB_REPOSITORY/actions/artifacts/$CANDIDATE_ARTIFACT_ID/zip" \
+            > "$archive"
+          [[ -f "$archive" && ! -L "$archive" ]]
+          expected_size=$(jq -er '.size_in_bytes' "$artifact_file")
+          [[ "$expected_size" =~ ^[1-9][0-9]*$ ]]
+          [[ $(stat -c '%s' "$archive") == "$expected_size" ]]
+          [[ $(sha256sum "$archive" | awk '{ print $1 }') == \
+             "$CANDIDATE_ARTIFACT_SHA256" ]]
+
+          download_dir="$RUNNER_TEMP/reviewed-candidate"
+          ./scripts/inputs/extract-reviewed-candidate.py \
+            "$archive" "$download_dir"
+          unsafe_node=$(find "$download_dir" -mindepth 1 \
+            ! -type f ! -type d -print -quit)
+          [[ -z "$unsafe_node" ]]
+          expected_root="$RUNNER_TEMP/reviewed-candidate-root.expected"
+          actual_root="$RUNNER_TEMP/reviewed-candidate-root.actual"
+          printf '%s\n' candidate-out configs imagebuilders locks metadata \
+            package-cache package-snapshot-bundles package-snapshots \
+            verification-out PLAN_INPUTS.sha256 PLAN_INPUT_REVISION.txt \
+            REPORT.md | sort > "$expected_root"
+          find "$download_dir" -mindepth 1 -maxdepth 1 -printf '%f\n' | \
+            sort > "$actual_root"
+          cmp -- "$expected_root" "$actual_root"
+          for directory in candidate-out configs imagebuilders locks metadata \
+              package-cache package-snapshot-bundles package-snapshots \
+              verification-out; do
+            [[ -d "$download_dir/$directory" && \
+               ! -L "$download_dir/$directory" ]]
+          done
+          for file in PLAN_INPUTS.sha256 PLAN_INPUT_REVISION.txt REPORT.md; do
+            [[ -f "$download_dir/$file" && ! -L "$download_dir/$file" ]]
+          done
+          [[ -f "$download_dir/locks/release.env" && \
+             ! -L "$download_dir/locks/release.env" ]]
+          [[ -f "$download_dir/PLAN_INPUT_REVISION.txt" && \
+             ! -L "$download_dir/PLAN_INPUT_REVISION.txt" ]]
+          [[ $(wc -l < "$download_dir/PLAN_INPUT_REVISION.txt") -eq 1 ]]
+          grep -Fqx "$candidate_sha" "$download_dir/PLAN_INPUT_REVISION.txt"
+          grep -Fqx "IMMORTALWRT_VERSION=$EXPECTED_VERSION" \
+            "$download_dir/locks/release.env"
+          grep -Fqx \
+            "LOCKED_INPUT_RELEASE_TAG=hmxf-openwrt-inputs-$EXPECTED_VERSION" \
+            "$download_dir/locks/release.env"
+          printf 'directory=%s\n' "$download_dir" >> "$GITHUB_OUTPUT"
+          printf 'head_sha=%s\n' "$candidate_sha" >> "$GITHUB_OUTPUT"
+      - name: Install candidate verification and UEFI test tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes build-essential curl file gawk gettext gzip ovmf python3 qemu-system-x86 rsync shellcheck squashfs-tools unzip zstd
+      - name: Strictly stage the six immutable release assets
+        id: stage
+        shell: bash
+        env:
+          EXPECTED_VERSION: ${{ inputs.expected_version }}
+          CANDIDATE_DIR: ${{ steps.candidate.outputs.directory }}
+        run: |
+          source ./scripts/lib/common.sh
+          verify_plan_input_contract \
+            "$CANDIDATE_DIR/PLAN_INPUTS.sha256" \
+            "$CANDIDATE_DIR/PLAN_INPUT_REVISION.txt"
+          stage_dir="$RUNNER_TEMP/hmxf-openwrt-inputs-$EXPECTED_VERSION"
+          ./scripts/inputs/stage-locked-input-release.sh \
+            --candidate "$CANDIDATE_DIR" "$stage_dir"
+          [[ $(find "$stage_dir" -mindepth 1 -maxdepth 1 -type f | wc -l) -eq 7 ]]
+          [[ -z $(find "$stage_dir" -mindepth 1 -maxdepth 1 ! -type f -print -quit) ]]
+          candidate_root="$PWD/build/lock-refresh/$EXPECTED_VERSION"
+          mkdir -p "$PWD/build/lock-refresh"
+          [[ ! -e "$candidate_root" && ! -L "$candidate_root" ]]
+          mv -- "$CANDIDATE_DIR" "$candidate_root"
+          {
+            printf 'directory=%s\n' "$stage_dir"
+            printf 'candidate_directory=%s\n' "$candidate_root"
+            printf 'tag=hmxf-openwrt-inputs-%s\n' "$EXPECTED_VERSION"
+          } >> "$GITHUB_OUTPUT"
+      - name: Prepare and remotely verify a recoverable draft
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_SHA: ${{ steps.candidate.outputs.head_sha }}
+          CANDIDATE_DIR: ${{ steps.stage.outputs.candidate_directory }}
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+          CANDIDATE_ARTIFACT_ID: ${{ inputs.candidate_artifact_id }}
+          CANDIDATE_ARTIFACT_SHA256: ${{ inputs.candidate_artifact_sha256 }}
+          RELEASE_DIR: ${{ steps.stage.outputs.directory }}
+          RELEASE_TAG: ${{ steps.stage.outputs.tag }}
+        run: |
+          set -euo pipefail
+          source ./scripts/lib/github-release.sh
+          github_release_require_tools
+          [[ "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$CANDIDATE_ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$CANDIDATE_ARTIFACT_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ $(find "$RELEASE_DIR" -mindepth 1 -maxdepth 1 -type f | \
+            wc -l) -eq 7 ]]
+          [[ -z $(find "$RELEASE_DIR" -mindepth 1 -maxdepth 1 ! -type f \
+            -print -quit) ]]
+          release_json="$RUNNER_TEMP/reviewed-input-release.json"
+          if github_release_find_by_tag "$RELEASE_TAG" "$release_json"; then
+            is_draft=$(jq -r '.draft' "$release_json")
+            [[ "$is_draft" =~ ^(true|false)$ ]]
+            github_assert_release_metadata \
+              "$release_json" "$RELEASE_TAG" "$is_draft" false
+            if [[ "$is_draft" == true ]]; then
+              github_rebind_draft_tag_at_commit \
+                "$release_json" "$RELEASE_TAG" "$CANDIDATE_SHA"
+              github_replace_draft_assets \
+                "$release_json" "$RELEASE_TAG" "$RELEASE_DIR"
+              github_release_find_by_tag "$RELEASE_TAG" "$release_json"
+              github_assert_release_metadata \
+                "$release_json" "$RELEASE_TAG" true false
+            else
+              diff -qr --no-dereference -- "$CANDIDATE_DIR/locks" locks \
+                >/dev/null
+              for target in x86_64 rpi4 rpi5; do
+                cmp -s "$CANDIDATE_DIR/configs/$target.config" \
+                  "configs/$target.config"
+              done
+            fi
+            github_require_lightweight_tag_at_commit \
+              "$RELEASE_TAG" "$CANDIDATE_SHA"
+            github_verify_release_assets "$release_json" "$RELEASE_DIR"
+          else
+            lookup_status=$?
+            (( lookup_status == 1 )) || exit "$lookup_status"
+            github_bind_unreleased_lightweight_tag_at_commit \
+              "$RELEASE_TAG" "$CANDIDATE_SHA"
+            mapfile -d '' assets < <(
+              find "$RELEASE_DIR" -mindepth 1 -maxdepth 1 -type f \
+                -print0 | sort -z
+            )
+            [[ ${#assets[@]} -eq 7 ]]
+            gh release create "$RELEASE_TAG" "${assets[@]}" \
+              --repo "$GITHUB_REPOSITORY" --verify-tag --draft \
+              --latest=false --title "Locked build inputs $RELEASE_TAG" \
+              --notes "Manually published from reviewed refresh run $CANDIDATE_RUN_ID, Artifact $CANDIDATE_ARTIFACT_ID, SHA-256 $CANDIDATE_ARTIFACT_SHA256."
+            github_release_find_by_tag "$RELEASE_TAG" "$release_json"
+            github_assert_release_metadata \
+              "$release_json" "$RELEASE_TAG" true false
+            github_verify_release_assets "$release_json" "$RELEASE_DIR"
+          fi
+          github_require_lightweight_tag_at_commit \
+            "$RELEASE_TAG" "$CANDIDATE_SHA"
+      - name: Apply the reviewed candidate and rerun its complete gates
+        env:
+          CANDIDATE_DIR: ${{ steps.stage.outputs.candidate_directory }}
+          EXPECTED_VERSION: ${{ inputs.expected_version }}
+        run: |
+          set -euo pipefail
+          make apply-locks CANDIDATE="$CANDIDATE_DIR"
+          grep -Fqx "IMMORTALWRT_VERSION=$EXPECTED_VERSION" locks/release.env
+          grep -Fqx \
+            "LOCKED_INPUT_RELEASE_TAG=hmxf-openwrt-inputs-$EXPECTED_VERSION" \
+            locks/release.env
+          make test
+          mapfile -t changed < <(
+            { git diff --name-only; git ls-files --others --exclude-standard; } |
+              sort -u
+          )
+          for path in "${changed[@]}"; do
+            case "$path" in
+              locks/* | configs/x86_64.config | configs/rpi4.config | configs/rpi5.config) ;;
+              *) printf 'error: reviewed candidate changed forbidden path: %s\n' "$path" >&2; exit 1 ;;
+            esac
+          done
+      - name: Commit and push only the reviewed generated locks
+        id: commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_VERSION: ${{ inputs.expected_version }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          EXPECTED_BASE: ${{ steps.candidate.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          for tool in base64 git; do
+            command -v "$tool" >/dev/null
+          done
+          [[ "$EXPECTED_BASE" =~ ^[0-9a-f]{40}$ ]]
+          [[ -n "$DEFAULT_BRANCH" ]]
+          git check-ref-format "refs/heads/$DEFAULT_BRANCH" >/dev/null
+          [[ $(git rev-parse HEAD) == "$EXPECTED_BASE" ]]
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add locks configs/x86_64.config configs/rpi4.config configs/rpi5.config
+          basic_auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          auth_key=http.https://github.com/.extraheader
+          remote_output=$(git -c \
+            "$auth_key=AUTHORIZATION: basic $basic_auth" \
+            ls-remote --refs origin "refs/heads/$DEFAULT_BRANCH")
+          [[ -n "$remote_output" && $(wc -l <<< "$remote_output") -eq 1 ]]
+          read -r remote_commit remote_ref extra <<< "$remote_output"
+          [[ -z "${extra:-}" ]]
+          [[ "$remote_commit" == "$EXPECTED_BASE" ]]
+          [[ "$remote_ref" == "refs/heads/$DEFAULT_BRANCH" ]]
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: lock ImmortalWrt $EXPECTED_VERSION [skip ci]"
+            git -c "$auth_key=AUTHORIZATION: basic $basic_auth" push \
+              --force-with-lease="refs/heads/$DEFAULT_BRANCH:$EXPECTED_BASE" \
+              origin "HEAD:refs/heads/$DEFAULT_BRANCH"
+          fi
+          [[ -z $(git status --porcelain) ]]
+          pushed_commit=$(git rev-parse HEAD)
+          [[ "$pushed_commit" =~ ^[0-9a-f]{40}$ ]]
+          pushed_output=$(git -c \
+            "$auth_key=AUTHORIZATION: basic $basic_auth" \
+            ls-remote --refs origin "refs/heads/$DEFAULT_BRANCH")
+          [[ $(wc -l <<< "$pushed_output") -eq 1 ]]
+          read -r pushed_remote pushed_ref pushed_extra <<< "$pushed_output"
+          [[ -z "${pushed_extra:-}" ]]
+          [[ "$pushed_remote" == "$pushed_commit" ]]
+          [[ "$pushed_ref" == "refs/heads/$DEFAULT_BRANCH" ]]
+          printf 'commit=%s\n' "$pushed_commit" >> "$GITHUB_OUTPUT"
+      - name: Bind the draft to the pushed locks and publish once
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUSHED_COMMIT: ${{ steps.commit.outputs.commit }}
+          RELEASE_DIR: ${{ steps.stage.outputs.directory }}
+          RELEASE_TAG: ${{ steps.stage.outputs.tag }}
+        run: |
+          set -euo pipefail
+          source ./scripts/lib/github-release.sh
+          github_release_require_tools
+          [[ "$PUSHED_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          release_json="$RUNNER_TEMP/reviewed-input-finalize.json"
+          github_release_find_by_tag "$RELEASE_TAG" "$release_json"
+          is_draft=$(jq -r '.draft' "$release_json")
+          [[ "$is_draft" =~ ^(true|false)$ ]]
+          github_assert_release_metadata \
+            "$release_json" "$RELEASE_TAG" "$is_draft" false
+          github_verify_release_assets "$release_json" "$RELEASE_DIR"
+          if [[ "$is_draft" == true ]]; then
+            github_rebind_draft_tag_at_commit \
+              "$release_json" "$RELEASE_TAG" "$PUSHED_COMMIT"
+            github_publish_draft_and_require_immutable \
+              "$RELEASE_TAG" false false "$RELEASE_DIR"
+          fi
+          github_release_find_by_tag "$RELEASE_TAG" "$release_json"
+          github_assert_release_metadata \
+            "$release_json" "$RELEASE_TAG" false false
+          github_require_lightweight_tag_at_commit \
+            "$RELEASE_TAG" "$PUSHED_COMMIT"
+          github_verify_release_assets "$release_json" "$RELEASE_DIR"

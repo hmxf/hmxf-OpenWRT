@@ -1,0 +1,11 @@
+# target|preset|filename|sha256
+x86_64|minimal|immortalwrt-25.12.1-minimal-x86-64-generic-squashfs-combined-efi.img.gz|0be09cfa5a2388bb511c0e74d27344c2ab9e2bd9771068d2b6abd243d5fbfc72
+x86_64|full|immortalwrt-25.12.1-full-x86-64-generic-squashfs-combined-efi.img.gz|ab1705c8b37e57eb1f0a7006e693dca7579c7fc78ce9c28c58e04f0fd2f31a8a
+rpi4|minimal|immortalwrt-25.12.1-minimal-bcm27xx-bcm2711-rpi-4-squashfs-factory.img.gz|7246fa4705c7011baaa30d08d0d4a75c99b0d83599ecbf675c8c05410c37ed6f
+rpi4|minimal|immortalwrt-25.12.1-minimal-bcm27xx-bcm2711-rpi-4-squashfs-sysupgrade.img.gz|58feae3815165a8a0cb86a23199fb4a2ab312338e85898872707bcfd611f349c
+rpi4|full|immortalwrt-25.12.1-full-bcm27xx-bcm2711-rpi-4-squashfs-factory.img.gz|145113ddf410abb3d1fe26a25be6980b7c641ed7eceb2d95361d204594d589ff
+rpi4|full|immortalwrt-25.12.1-full-bcm27xx-bcm2711-rpi-4-squashfs-sysupgrade.img.gz|c276760397b06418f88d6bc9c034c2a0624135c4afabc956841a7615677b6050
+rpi5|minimal|immortalwrt-25.12.1-minimal-bcm27xx-bcm2712-rpi-5-squashfs-factory.img.gz|46918595eff528dd4a6ce8d2b8732180d3ff042be42fb3abb3a584b40be6e49d
+rpi5|minimal|immortalwrt-25.12.1-minimal-bcm27xx-bcm2712-rpi-5-squashfs-sysupgrade.img.gz|adf05592b9cc7330233631295b5c4bc7fc4ca964c93a75ff897d794806cd073a
+rpi5|full|immortalwrt-25.12.1-full-bcm27xx-bcm2712-rpi-5-squashfs-factory.img.gz|eb60704ceb03623de885902ec6f7d1e32e638cfadd43598e050cdc7c1a41a145
+rpi5|full|immortalwrt-25.12.1-full-bcm27xx-bcm2712-rpi-5-squashfs-sysupgrade.img.gz|1019a6451e55a1e0ed96cb07c08f0adb24c2eb28a043075ca43c8159e464e9ab
