@@ -4,7 +4,7 @@
 
 项目中不存在刷机后运行的安装脚本。仓库里的脚本只负责下载校验、配置、组装和验证镜像；刷机后的软件安装、驱动安装、备份和升级全部通过 LuCI 网页完成。
 
-仓库的受控目录、脚本分类以及生成目录生命周期见[目录结构说明](docs/repository-layout.md)；本地测试入口、生产/开发构建测试的区别见[测试说明](tests/README.md)。
+仓库的受控目录、脚本分类以及生成目录生命周期见[目录结构说明](docs/repository-layout.md)；本地、CI、stable/nightly 发布和缓存信任链见[工程执行逻辑](docs/execution-flow.md)；本地测试入口、生产/开发构建测试的区别见[测试说明](tests/README.md)。
 
 ## 为什么选择 ImmortalWrt
 
