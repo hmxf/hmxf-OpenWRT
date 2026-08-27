@@ -53,7 +53,7 @@ jobs:
       present: ${{ steps.probe.outputs.present }}
     steps:
       - name: Check out only the current lock identity
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Enumerate the exact locked-input tag without mutating it
@@ -125,7 +125,7 @@ jobs:
       fingerprint: ${{ steps.classify.outputs.fingerprint }}
     steps:
       - name: Check out the current release plan
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Detect stable, source snapshot, and feed changes
@@ -807,7 +807,7 @@ jobs:
       contents: write
     steps:
       - name: Check out the default branch without stored credentials
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Commit one monthly marker only on automation/keepalive
@@ -891,7 +891,7 @@ jobs:
       contents: read
     steps:
       - name: Check out the exact detection revision
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Install stable refresh and UEFI validation tools
@@ -940,7 +940,7 @@ jobs:
       version: ${{ needs.detect.outputs.stable_version }}
     steps:
       - name: Check out the candidate plan revision
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Download the stable candidate
@@ -1189,7 +1189,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Verify current locks against every draft byte and publish once
@@ -1322,7 +1322,7 @@ jobs:
       contents: write
     steps:
       - name: Check out the exact canonical build revision
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.stable-ref.outputs.commit }}
           persist-credentials: false
@@ -1432,7 +1432,7 @@ jobs:
       fingerprint: ${{ steps.identity.outputs.fingerprint }}
     steps:
       - name: Check out the current nightly build plan
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
@@ -1538,7 +1538,7 @@ jobs:
           - rpi5
     steps:
       - name: Check out the exact nightly build plan
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
@@ -1598,7 +1598,7 @@ jobs:
       contents: read
     steps:
       - name: Check out trusted release staging code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
@@ -1718,7 +1718,7 @@ jobs:
       contents: write
     steps:
       - name: Check out only the trusted publication helper
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
