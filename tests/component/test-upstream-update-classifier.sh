@@ -15,6 +15,13 @@ digest_b=$(printf b | sha256sum | awk '{ print $1 }')
 digest_c=$(printf c | sha256sum | awk '{ print $1 }')
 feed_commit_a=1111111111111111111111111111111111111111
 feed_commit_b=2222222222222222222222222222222222222222
+locked_version=$(awk -F= '
+    $1 == "IMMORTALWRT_VERSION" { count += 1; value = $2 }
+    END { if (count == 1) print value; else exit 1 }
+' "$PROJECT_ROOT/locks/release.env")
+[[ "$locked_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+IFS=. read -r version_major version_minor version_patch <<< "$locked_version"
+new_stable_version="$version_major.$version_minor.$((10#$version_patch + 1))"
 
 state_value() {
     local file=$1
@@ -90,16 +97,17 @@ write_snapshot() {
 }
 
 stable_fixture="$tmp_dir/stable"
-write_release_index "$stable_fixture" 25.12.2
-write_stable_checksums "$stable_fixture" 25.12.2
+write_release_index "$stable_fixture" "$new_stable_version"
+write_stable_checksums "$stable_fixture" "$new_stable_version"
 stable_state="$tmp_dir/stable.env"
 "$checker" --fixture-root "$stable_fixture" --output "$stable_state" \
     --stable-release-present 1
 [[ $(state_value "$stable_state" CHANNEL) == stable ]]
 [[ $(state_value "$stable_state" REASON) == new-stable ]]
-[[ $(state_value "$stable_state" LATEST_STABLE_VERSION) == 25.12.2 ]]
+[[ $(state_value "$stable_state" LATEST_STABLE_VERSION) == \
+   "$new_stable_version" ]]
 
-rm -f "$stable_fixture/releases/25.12.2/targets/bcm27xx/bcm2712/sha256sums"
+rm -f "$stable_fixture/releases/$new_stable_version/targets/bcm27xx/bcm2712/sha256sums"
 deferred_state="$tmp_dir/deferred.env"
 "$checker" --fixture-root "$stable_fixture" --output "$deferred_state" \
     --stable-release-present 1
@@ -107,7 +115,7 @@ deferred_state="$tmp_dir/deferred.env"
 [[ $(state_value "$deferred_state" REASON) == stable-publishing-in-progress ]]
 
 snapshot_fixture="$tmp_dir/snapshot"
-write_release_index "$snapshot_fixture" 25.12.1
+write_release_index "$snapshot_fixture" "$locked_version"
 write_snapshot "$snapshot_fixture" r40000-abcdef123456 "$feed_commit_a"
 first_nightly="$tmp_dir/first-nightly.env"
 "$checker" --fixture-root "$snapshot_fixture" --output "$first_nightly" \
@@ -165,8 +173,8 @@ source_state="$tmp_dir/source.env"
 # Explicit check/nightly modes must not be preempted by an available newer
 # stable release.  "check" remains read-only; "nightly" selects the synchronized
 # snapshot even when auto mode would prioritize stable.
-write_release_index "$snapshot_fixture" 25.12.2
-write_stable_checksums "$snapshot_fixture" 25.12.2
+write_release_index "$snapshot_fixture" "$new_stable_version"
+write_stable_checksums "$snapshot_fixture" "$new_stable_version"
 check_state="$tmp_dir/check.env"
 "$checker" --fixture-root "$snapshot_fixture" --state "$source_state" \
     --output "$check_state" --stable-release-present 1 --force check
@@ -178,7 +186,7 @@ forced_nightly_state="$tmp_dir/forced-nightly.env"
 [[ $(state_value "$forced_nightly_state" CHANNEL) == nightly ]]
 [[ $(state_value "$forced_nightly_state" REASON) == manual-nightly ]]
 
-write_release_index "$snapshot_fixture" 25.12.1
+write_release_index "$snapshot_fixture" "$locked_version"
 second_sample_index="$snapshot_fixture/.sample-2/snapshots/packages/x86_64/base/packages.adb"
 mkdir -p -- "$(dirname -- "$second_sample_index")"
 printf '%s\n' 'ADBd index changed during the second complete sample' \

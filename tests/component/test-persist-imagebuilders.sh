@@ -7,7 +7,7 @@ PROJECT_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
 # shellcheck source=../../scripts/lib/common.sh
 source "$PROJECT_ROOT/scripts/lib/common.sh"
 
-for tool in cp mktemp sha256sum stat; do
+for tool in mktemp sha256sum stat; do
     require_command "$tool"
 done
 
@@ -20,7 +20,30 @@ trap cleanup EXIT
 candidate="$temporary_dir/candidate"
 store="$temporary_dir/store"
 mkdir -p "$candidate/locks" "$candidate/imagebuilders" "$store"
-cp -- "$PROJECT_ROOT/locks/release.env" "$candidate/locks/release.env"
+# Reuse the current lock schema and immutable identities, but deliberately give
+# this fixture an unrelated stable version.  This prevents the test from
+# passing only while a version literal happens to match the formal lock.
+fixture_version=99.88.77
+while IFS= read -r line || [[ -n "$line" ]]; do
+    case "$line" in
+        IMMORTALWRT_VERSION=*)
+            printf 'IMMORTALWRT_VERSION=%s\n' "$fixture_version"
+            ;;
+        IMMORTALWRT_TAG=*)
+            printf 'IMMORTALWRT_TAG=v%s\n' "$fixture_version"
+            ;;
+        LOCKED_INPUT_RELEASE_TAG=*)
+            printf 'LOCKED_INPUT_RELEASE_TAG=hmxf-openwrt-inputs-%s\n' \
+                "$fixture_version"
+            ;;
+        *) printf '%s\n' "$line" ;;
+    esac
+done < "$PROJECT_ROOT/locks/release.env" > "$candidate/locks/release.env"
+
+RELEASE_LOCK="$candidate/locks/release.env"
+load_release_lock
+[[ "$IMMORTALWRT_VERSION" == "$fixture_version" ]] || \
+    die 'ImageBuilder persistence fixture version was not applied'
 
 declare -a target_rows=(
     'x86_64|x86|64|generic|x86_64'
@@ -32,7 +55,7 @@ printf '%s\n' \
     > "$candidate/locks/targets.tsv"
 for row in "${target_rows[@]}"; do
     IFS='|' read -r name target subtarget _profile _arch <<< "$row"
-    archive_name="immortalwrt-imagebuilder-25.12.1-$target-$subtarget.Linux-x86_64.tar.zst"
+    archive_name="immortalwrt-imagebuilder-$fixture_version-$target-$subtarget.Linux-x86_64.tar.zst"
     printf 'fixture-%s\n' "$name" > "$candidate/imagebuilders/$archive_name"
     digest=$(sha256sum "$candidate/imagebuilders/$archive_name" | awk '{ print $1 }')
     bytes=$(stat -c '%s' "$candidate/imagebuilders/$archive_name")
