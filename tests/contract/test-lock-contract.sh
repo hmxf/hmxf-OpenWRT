@@ -51,6 +51,32 @@ fi
 grep -Fq 'After the new lock commit is exact-lease pushed' "$REFRESH_SCRIPT" || \
     die 'generated candidate report omits the recoverable draft transaction'
 
+# A clean CI runner has no sibling ImmortalWrt checkout.  In that case the
+# refresh script creates work/source solely to read the signed release tag.
+# It must remove that owned clone before both the prepare-only exit and the
+# final rmdir guard; otherwise every new stable release fails after all six
+# expensive live builds have already completed.
+grep -Fq "temporary_release_repository=\"\$work_dir/source\"" "$REFRESH_SCRIPT" || \
+    die 'lock refresh does not identify its temporary release source clone'
+metadata_export_line=$(grep -nF \
+    "> \"\$metadata_dir/source-version.mk\"" "$REFRESH_SCRIPT" | \
+    sed -n '1s/:.*//p')
+temporary_source_cleanup_line=$(grep -nF \
+    "rm -rf -- \"\$temporary_release_repository\"" "$REFRESH_SCRIPT" | \
+    sed -n '1s/:.*//p')
+prepare_only_line=$(grep -nF 'if (( prepare_only == 1 )); then' "$REFRESH_SCRIPT" | \
+    sed -n '1s/:.*//p')
+work_directory_guard_line=$(grep -nF "rmdir -- \"\$work_dir\"" "$REFRESH_SCRIPT" | \
+    sed -n '1s/:.*//p')
+[[ "$metadata_export_line" =~ ^[1-9][0-9]*$ && \
+   "$temporary_source_cleanup_line" =~ ^[1-9][0-9]*$ && \
+   "$prepare_only_line" =~ ^[1-9][0-9]*$ && \
+   "$work_directory_guard_line" =~ ^[1-9][0-9]*$ && \
+   $metadata_export_line -lt $temporary_source_cleanup_line && \
+   $temporary_source_cleanup_line -lt $prepare_only_line && \
+   $prepare_only_line -lt $work_directory_guard_line ]] || \
+    die 'temporary release source lifecycle is not bounded by metadata export and work cleanup'
+
 reset_fixture
 sed -i '1s/^# name|/# unexpected|/' "$temporary_dir/locks/targets.tsv"
 expect_failure 'target lock schema header drift'

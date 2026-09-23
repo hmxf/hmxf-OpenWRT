@@ -143,6 +143,7 @@ write_plan_input_contract "$plan_input_manifest" "$plan_input_revision"
 tag="v$requested_version"
 tag_ref="refs/tags/$tag"
 source_repository=${SOURCE_REPOSITORY:-"$(dirname -- "$PROJECT_ROOT")/ImmortalWRT"}
+temporary_release_repository=
 remote_tag_object=
 remote_source_commit=
 if (( refresh_offline == 0 )); then
@@ -174,7 +175,8 @@ if git -C "$source_repository" rev-parse --is-inside-work-tree >/dev/null 2>&1 &
 else
     (( refresh_offline == 0 )) || \
         die "offline refresh cannot fetch missing source tag $tag"
-    release_repository="$work_dir/source"
+    temporary_release_repository="$work_dir/source"
+    release_repository=$temporary_release_repository
     git init "$release_repository"
     git -C "$release_repository" remote add origin "$source_url"
     source_fetch_ok=0
@@ -208,6 +210,12 @@ git -C "$release_repository" show "$tag:feeds.conf.default" > "$metadata_dir/fee
 git -C "$release_repository" show "$tag:version" > "$metadata_dir/source.version"
 git -C "$release_repository" show "$tag:include/version.mk" \
     > "$metadata_dir/source-version.mk"
+if [[ -n "$temporary_release_repository" ]]; then
+    [[ "$temporary_release_repository" == "$work_dir/source" && \
+       -d "$temporary_release_repository" && ! -L "$temporary_release_repository" ]] || \
+        die 'temporary release source repository is missing or unsafe'
+    rm -rf -- "$temporary_release_repository"
+fi
 
 python3 - "$metadata_dir/feeds.conf.default" > "$candidate_locks/feeds.tsv" <<'PY'
 from pathlib import Path
