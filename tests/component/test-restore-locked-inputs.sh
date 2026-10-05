@@ -20,10 +20,12 @@ for tool in chmod cmp cp diff find mkdir mkfifo mktemp python3 rm sha256sum sort
 done
 
 temporary_dir=$(mktemp -d)
+nightly_root=
 cleanup() {
     local status=$?
     trap - EXIT
     rm -rf -- "$temporary_dir"
+    [[ -z "$nightly_root" ]] || rm -rf -- "$nightly_root"
     exit "$status"
 }
 trap cleanup EXIT
@@ -397,5 +399,59 @@ ln -s -- "$victim/marker" \
     "$lock_case/snapshots/.locked-input-restore-$VERSION-$TARGET_NAME.lock"
 expect_failure 'symbolic-link restore lock' run_restore "$lock_case" "$SOURCE_DIR"
 [[ $(<"$victim/marker") == 'keep me' ]] || fail 'lock symlink victim was modified'
+
+# The frozen nightly rebuild calls this helper in a separate process. Only the
+# phase overrides are exported; the rest of the nightly policy comes from its
+# configuration file, including REQUIRE_CLEAN_PROJECT=0.
+nightly_fingerprint=$(printf 'nightly-restore:%s\n' "$temporary_dir" | \
+    sha256sum | awk '{ print $1 }')
+nightly_root="$PROJECT_ROOT/build/nightly/$nightly_fingerprint"
+(
+    VERSION=SNAPSHOT
+    IMAGEBUILDER_FILE=immortalwrt-imagebuilder-x86-64.Linux-x86_64.tar.zst
+    BUNDLE_FILE=immortalwrt-SNAPSHOT-x86_64-package-snapshot.tar.zst
+    nightly_source="$temporary_dir/nightly-source"
+    nightly_tree="$temporary_dir/nightly-tree"
+    nightly_locks="$nightly_root/context/locks"
+    mkdir -p "$nightly_source" "$nightly_tree/$VERSION"
+    cp -- "$SOURCE_DIR/immortalwrt-imagebuilder-99.88.77-x86-64.Linux-x86_64.tar.zst" \
+        "$nightly_source/$IMAGEBUILDER_FILE"
+    cp -a -- "$TREE" "$nightly_tree/$VERSION/$TARGET_NAME"
+    create_bundle "$nightly_tree" "$nightly_source/$BUNDLE_FILE"
+    write_locks "$nightly_locks" "$nightly_source/$BUNDLE_FILE" \
+        "$TREE_MANIFEST_SHA"
+    sed -i \
+        -e 's/^IMMORTALWRT_TAG=.*/IMMORTALWRT_TAG=SNAPSHOT/' \
+        -e 's/^IMMORTALWRT_TAG_OBJECT=.*/IMMORTALWRT_TAG_OBJECT=1111111111111111111111111111111111111111/' \
+        -e 's/^IMMORTALWRT_VERSION_CODE=.*/IMMORTALWRT_VERSION_CODE=r1-1111111/' \
+        -e "s/^LOCKED_INPUT_RELEASE_TAG=.*/LOCKED_INPUT_RELEASE_TAG=nightly-$nightly_fingerprint/" \
+        "$nightly_locks/release.env"
+    sed -i 's/immortalwrt-imagebuilder-SNAPSHOT-/immortalwrt-imagebuilder-/g' \
+        "$nightly_locks/targets.tsv"
+    unset REQUIRE_CLEAN_PROJECT BUILD_CONFIG_FILE
+    nightly_restore() {
+        BUILD_CHANNEL=nightly NIGHTLY_FINGERPRINT="$nightly_fingerprint" \
+        BUILD_CONFIG_FILE="$PROJECT_ROOT/configs/build-nightly.env" \
+        BUILD_CONFIG=configs/build-nightly.env ARTIFACT_LOCK_POLICY=enforce \
+        PACKAGE_REPOSITORY_MODE=snapshot PACKAGE_CACHE_INDEX=0 \
+            run_restore "$temporary_dir/nightly-destination" \
+                "$nightly_source" "$nightly_locks"
+    }
+    nightly_restore >/dev/null
+    cmp -s "$nightly_source/$IMAGEBUILDER_FILE" \
+        "$temporary_dir/nightly-destination/imagebuilders/$IMAGEBUILDER_FILE" || \
+        fail 'nightly ImageBuilder differs from the source'
+    diff -r "$nightly_tree/$VERSION/$TARGET_NAME" \
+        "$temporary_dir/nightly-destination/snapshots/$VERSION/$TARGET_NAME" \
+        >/dev/null || fail 'nightly snapshot tree differs from the source'
+    expect_failure 'nightly clean-policy override' env REQUIRE_CLEAN_PROJECT=1 \
+        BUILD_CHANNEL=nightly NIGHTLY_FINGERPRINT="$nightly_fingerprint" \
+        BUILD_CONFIG=configs/build-nightly.env ARTIFACT_LOCK_POLICY=enforce \
+        PACKAGE_REPOSITORY_MODE=snapshot PACKAGE_CACHE_INDEX=0 \
+        LOCKS_DIR="$nightly_locks" "$RESTORE" "$TARGET_NAME"
+    grep -Fq 'nightly context requires non-clean development policy' \
+        "$temporary_dir/expected-failure.log" || \
+        fail 'nightly policy override failed outside its policy gate'
+)
 
 printf 'restore-locked-inputs tests passed\n'

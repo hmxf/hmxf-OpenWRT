@@ -49,6 +49,7 @@ snapshot_verifier="$INPUT_SCRIPTS_DIR/verify-package-snapshot.py"
 [[ -f "$snapshot_verifier" && ! -L "$snapshot_verifier" ]] || \
     die "package snapshot verifier is unavailable: $snapshot_verifier"
 
+load_build_config
 load_release_lock
 load_target_lock "$1"
 load_package_snapshot_lock
