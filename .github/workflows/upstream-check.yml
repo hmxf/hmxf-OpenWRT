@@ -456,7 +456,7 @@ jobs:
                   sub(/^r[0-9]+-/, "", version_commit)
                   if (NR != 17 || value["STATE_SCHEMA"] != "1" ||
                       value["CHANNEL"] != "nightly" ||
-                      value["SNAPSHOT_VERSION_CODE"] !~
+                      value["SNAPSHOT_VERSION_CODE"] !~ \
                         /^r[0-9]+-[0-9a-f]{7,40}$/ ||
                       value["SNAPSHOT_SOURCE_COMMIT"] !~ /^[0-9a-f]{40}$/ ||
                       index(value["SNAPSHOT_SOURCE_COMMIT"], version_commit) != 1 ||
@@ -464,11 +464,11 @@ jobs:
                       value["SNAPSHOT_TARGETS_SHA256"] !~ /^[0-9a-f]{64}$/ ||
                       value["SNAPSHOT_PACKAGES_SHA256"] !~ /^[0-9a-f]{64}$/ ||
                       value["SNAPSHOT_FINGERPRINT"] !~ /^[0-9a-f]{64}$/ ||
-                      value["NIGHTLY_IMAGEBUILDER_X86_64_FILE"] !=
+                      value["NIGHTLY_IMAGEBUILDER_X86_64_FILE"] != \
                         "immortalwrt-imagebuilder-x86-64.Linux-x86_64.tar.zst" ||
-                      value["NIGHTLY_IMAGEBUILDER_RPI4_FILE"] !=
+                      value["NIGHTLY_IMAGEBUILDER_RPI4_FILE"] != \
                         "immortalwrt-imagebuilder-bcm27xx-bcm2711.Linux-x86_64.tar.zst" ||
-                      value["NIGHTLY_IMAGEBUILDER_RPI5_FILE"] !=
+                      value["NIGHTLY_IMAGEBUILDER_RPI5_FILE"] != \
                         "immortalwrt-imagebuilder-bcm27xx-bcm2712.Linux-x86_64.tar.zst" ||
                       value["NIGHTLY_IMAGEBUILDER_X86_64_SHA256"] !~ /^[0-9a-f]{64}$/ ||
                       value["NIGHTLY_IMAGEBUILDER_RPI4_SHA256"] !~ /^[0-9a-f]{64}$/ ||

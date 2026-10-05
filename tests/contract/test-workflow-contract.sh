@@ -20,7 +20,7 @@ die() {
     exit 1
 }
 
-for tool in awk grep wc; do
+for tool in awk grep python3 wc; do
     command -v "$tool" >/dev/null 2>&1 || die "missing test tool: $tool"
 done
 [[ -f "$UPSTREAM_WORKFLOW" && ! -L "$UPSTREAM_WORKFLOW" ]] || \
@@ -259,5 +259,69 @@ grep -Fq '$2 == "SHA256SUMS" || seen[$2]++' "$RELEASE_HELPER" || \
     die 'Release checksum manifests are not safe, unique basename-only indexes'
 grep -Fq 'cmp -- "$manifest_names" "$payload_names"' "$RELEASE_HELPER" || \
     die 'Release checksum manifests need not cover the exact payload set'
+
+# Execute the workflow's actual validator: shell syntax and source-text checks
+# cannot detect a parse error inside its quoted AWK program.
+python3 - "$UPSTREAM_WORKFLOW" <<'PY'
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tempfile
+import textwrap
+
+workflow = Path(sys.argv[1]).read_text()
+match = re.search(
+    r"^(?P<indent> +)validate_nightly_upstream_state\(\) \{\n.*?^(?P=indent)\}",
+    workflow, re.MULTILINE | re.DOTALL,
+)
+if match is None:
+    raise SystemExit("nightly upstream validator is missing")
+validator = textwrap.dedent(match.group()) + '\nvalidate_nightly_upstream_state "$1"\n'
+state = [
+    "STATE_SCHEMA=1", "CHANNEL=nightly", "REASON=no-previous-nightly",
+    "LOCKED_STABLE_VERSION=1.2.3", "LATEST_STABLE_VERSION=1.2.3",
+    "SNAPSHOT_VERSION_CODE=r40000-abcdef0",
+    "SNAPSHOT_SOURCE_COMMIT=abcdef0" + "0" * 33,
+    "SNAPSHOT_FEEDS_SHA256=" + "a" * 64,
+    "SNAPSHOT_TARGETS_SHA256=" + "b" * 64,
+    "SNAPSHOT_PACKAGES_SHA256=" + "c" * 64,
+    "SNAPSHOT_FINGERPRINT=" + "d" * 64,
+    "NIGHTLY_IMAGEBUILDER_X86_64_FILE=immortalwrt-imagebuilder-x86-64.Linux-x86_64.tar.zst",
+    "NIGHTLY_IMAGEBUILDER_X86_64_SHA256=" + "e" * 64,
+    "NIGHTLY_IMAGEBUILDER_RPI4_FILE=immortalwrt-imagebuilder-bcm27xx-bcm2711.Linux-x86_64.tar.zst",
+    "NIGHTLY_IMAGEBUILDER_RPI4_SHA256=" + "f" * 64,
+    "NIGHTLY_IMAGEBUILDER_RPI5_FILE=immortalwrt-imagebuilder-bcm27xx-bcm2712.Linux-x86_64.tar.zst",
+    "NIGHTLY_IMAGEBUILDER_RPI5_SHA256=" + "1" * 64,
+]
+cases = [("valid", state, 0), ("reordered", list(reversed(state)), 0),
+         ("missing key", state[:-1], 1), ("extra key", state + ["EXTRA=1"], 1)]
+for index, replacement in [
+    (0, "STATE_SCHEMA=2"), (1, "CHANNEL=stable"),
+    (4, state[3]), (4, "UNKNOWN=1"),
+    (5, "SNAPSHOT_VERSION_CODE=invalid"),
+    (6, "SNAPSHOT_SOURCE_COMMIT=" + "f" * 40),
+    (7, "SNAPSHOT_FEEDS_SHA256=invalid"),
+    (11, "NIGHTLY_IMAGEBUILDER_X86_64_FILE=wrong.tar.zst"),
+    (13, "NIGHTLY_IMAGEBUILDER_RPI4_FILE=wrong.tar.zst"),
+    (15, "NIGHTLY_IMAGEBUILDER_RPI5_FILE=wrong.tar.zst"),
+    (16, "NIGHTLY_IMAGEBUILDER_RPI5_SHA256=invalid"),
+]:
+    invalid = state.copy()
+    invalid[index] = replacement
+    cases.append((replacement.split("=", 1)[0], invalid, 1))
+with tempfile.TemporaryDirectory() as directory:
+    path = Path(directory) / "UPSTREAM_STATE.env"
+    for name, lines, expected in cases:
+        path.write_text("\n".join(lines) + "\n")
+        result = subprocess.run(
+            ["bash", "-euo", "pipefail", "-c", validator, "workflow-validator", str(path)],
+            capture_output=True, text=True,
+        )
+        if result.returncode != expected:
+            raise SystemExit(f"nightly validator {name}: expected {expected}, "
+                             f"got {result.returncode}\n{result.stderr}")
+print("Workflow nightly state validator behavior passed.")
+PY
 
 printf '%s\n' 'Workflow publication and rerun contracts passed.'
