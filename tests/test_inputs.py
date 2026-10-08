@@ -266,6 +266,18 @@ class InputsTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             inputs.capture_repositories(ib, cache, [['base-files - nonexistent']], self.root / 'out')
 
+    def test_capture_accepts_apk_embedded_uid_distinct_from_index_identity(self):
+        # Actual 25.12.2 apk-openssl adbdump values: the index has a 32-byte
+        # package identity while package info retains a different 20-byte hash.
+        item = {'name': 'apk-openssl', 'version': '3.0.5-r3', 'arch': 'aarch64_cortex-a76',
+                'hashes': '5cf94b98d99bb0b0cb0258aec0f96b521f8fc629a4e9db0a5066b40fad7504b9'}
+        ib, _, cache = self.fixture_repository([item])
+        cached = cache / 'apk-openssl-3.0.5-r3.5cf94b98.apk'
+        cached.write_text(json.dumps({'info': {**item, 'hashes': '6adce825cb434186006c53d3d8f405da91340362'}}))
+        dest = self.root / 'captured'
+        inputs.capture_repositories(ib, cache, [['apk-openssl - 3.0.5-r3']], dest)
+        self.assertEqual((dest / 'repo-1/apk-openssl-3.0.5-r3.apk').read_bytes(), cached.read_bytes())
+
     def test_extract_remaps_only_known_imagebuilder_host_tool_links(self):
         root = 'immortalwrt-imagebuilder-25.12.2-x86-64.Linux-x86_64'
         entries = [(root + '/scripts/noop.sh', 'file', b'#!/bin/sh\n'),

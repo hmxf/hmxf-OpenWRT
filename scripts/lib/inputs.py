@@ -504,8 +504,9 @@ def capture_repositories(imagebuilder, cache_dir, manifests, dest):
                 info = document.get('info')
                 if not isinstance(info, dict) or any(info.get(key) != item[key] for key in ('name', 'version', 'arch')):
                     raise ValueError(f'cached APK identity disagrees with signed index: {cached}')
-                if info.get('hashes') is not None and info['hashes'] != item['hashes']:
-                    raise ValueError(f'cached APK hash disagrees with signed index: {cached}')
+                # Package info can retain a distinct 20-byte hash. The signed
+                # index identity determines the cache suffix; APK validates the
+                # package's signature and ADB digest during offline replay.
                 matches.append((repository, item, cached))
         if len({item['hashes'] for _, item, _ in matches}) > 1:
             raise ValueError(f'ambiguous cached variants for package: {name} {version}')
