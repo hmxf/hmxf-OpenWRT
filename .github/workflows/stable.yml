@@ -1,0 +1,147 @@
+name: Latest stable firmware
+
+on:
+  schedule:
+    - cron: '17 2 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild the current stable source even if already published
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: latest-stable-firmware
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    outputs:
+      changed: ${{ steps.check.outputs.changed }}
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check new stable source
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          args=()
+          if [[ "$FORCE" == true ]]; then args+=(--force); fi
+          python3 scripts/firmware.py check --repository "$GITHUB_REPOSITORY" \
+            --output upstream.json "${args[@]}"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: steps.check.outputs.changed == 'true'
+        with:
+          name: upstream
+          path: upstream.json
+          retention-days: 3
+
+  environment:
+    needs: check
+    if: needs.check.outputs.changed == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Test modules
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends squashfs-tools zstd
+          python3 -m unittest discover -s tests -p 'test_*.py' -v
+      - name: Freeze tools and recipe
+        run: |
+          docker build -t firmware-build .
+          mkdir -p environment
+          docker image inspect --format '{{.Id}}' firmware-build > environment/image-id.txt
+          docker save firmware-build | zstd -T0 -9 > environment/build-environment.tar.zst
+          test "$(stat -c %s environment/build-environment.tar.zst)" -lt 2000000000
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: environment
+          path: environment/
+          compression-level: 0
+          retention-days: 3
+
+  build:
+    needs: [check, environment]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64, rpi4, rpi5]
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: environment
+          path: environment
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: upstream
+          path: work
+      - name: Build and repeat using frozen inputs
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          zstd -dc environment/build-environment.tar.zst | docker load
+          mkdir -p "work/targets/$TARGET"
+          image_id=$(cat environment/image-id.txt)
+          docker run --rm --user "$(id -u):$(id -g)" \
+            -v "$PWD/work:/work" "$image_id" \
+            build --upstream /work/upstream.json --target "$TARGET" --work "/work/targets/$TARGET"
+          docker run --rm --network none --user "$(id -u):$(id -g)" \
+            -v "$PWD/work:/work" "$image_id" \
+            _replay-target --upstream /work/upstream.json --target "$TARGET" --work "/work/targets/$TARGET"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: target-${{ matrix.target }}
+          path: |
+            work/targets/${{ matrix.target }}/result.json
+            work/targets/${{ matrix.target }}/artifacts/
+          compression-level: 0
+          retention-days: 3
+
+  publish:
+    needs: [check, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: upstream
+          path: work
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: environment
+          path: environment
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: target-x86_64
+          path: work/targets/x86_64
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: target-rpi4
+          path: work/targets/rpi4
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: target-rpi5
+          path: work/targets/rpi5
+      - name: Create successful build lock
+        run: |
+          python3 scripts/firmware.py lock --upstream work/upstream.json \
+            --results work/targets --environment environment/build-environment.tar.zst \
+            --image-id "$(cat environment/image-id.txt)" --commit "$GITHUB_SHA" \
+            --repository "$GITHUB_REPOSITORY" --output release
+      - name: Publish images, lock and rebuild inputs together
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/firmware.py publish release/LOCK.json

@@ -5,9 +5,16 @@ set -euo pipefail
 export LC_ALL=C
 export TZ=UTC
 
-SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-# shellcheck source=../lib/common.sh
-source "$SCRIPT_DIR/../lib/common.sh"
+die() {
+    printf 'error: %s\n' "$*" >&2
+    exit 1
+}
+require_command() {
+    command -v "$1" >/dev/null 2>&1 || die "required command is missing: $1"
+}
+require_regular_file_or_absent() {
+    [[ ! -L "$1" && ( ! -e "$1" || -f "$1" ) ]] || die "unsafe $2: $1"
+}
 
 artifact_dir=${1:?x86 artifact directory required}
 [[ -d "$artifact_dir" ]] || die "missing artifact directory: $artifact_dir"
@@ -21,8 +28,7 @@ done
 
 # Local users may launch minimal/full builds concurrently.  Serialize this
 # host-port-based test so the second image cannot collide with 127.0.0.1:18443.
-mkdir -p "$PROJECT_ROOT/build"
-smoke_lock="$PROJECT_ROOT/build/.x86-uefi-smoke.lock"
+smoke_lock="${TMPDIR:-/tmp}/hmxf-x86-uefi-smoke-${UID}.lock"
 require_regular_file_or_absent "$smoke_lock" 'x86 smoke-test lock'
 exec {smoke_lock_fd}>"$smoke_lock"
 flock "$smoke_lock_fd"
@@ -31,6 +37,7 @@ shopt -s nullglob
 images=("$artifact_dir"/*-squashfs-combined-efi.img.gz)
 [[ ${#images[@]} -eq 1 ]] || die "expected exactly one x86 combined EFI image"
 image=${images[0]}
+[[ -f "$image" && ! -L "$image" ]] || die "image is not a regular file: $image"
 
 ovmf_code=${OVMF_CODE_FILE:-}
 ovmf_vars=${OVMF_VARS_FILE:-}

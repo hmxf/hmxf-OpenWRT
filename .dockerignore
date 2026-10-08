@@ -1,0 +1,10 @@
+*
+!Dockerfile
+!scripts/
+!scripts/**
+!packages/
+!packages/**
+!files/
+!files/**
+**/__pycache__/
+**/*.pyc
