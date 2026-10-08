@@ -5,6 +5,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 import sys
+import subprocess
+from unittest.mock import MagicMock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 from lib import releases
@@ -124,6 +126,46 @@ class PublicationTests(unittest.TestCase):
                     releases.publish(document['release']['repository'], document, root)
                 self.assertTrue(api.call_args.args[1]['draft'])
                 self.assertEqual(api.call_count, 1)
+
+
+class EnvironmentTests(unittest.TestCase):
+    def test_loaded_runtime_identity_can_differ_from_historical_identity(self):
+        document = complete_lock()
+        runtime_id = 'sha256:' + 'e' * 64
+        decompressor = MagicMock()
+        decompressor.wait.return_value = 0
+        decompressor.poll.return_value = 0
+        loaded = subprocess.CompletedProcess([], 0, stdout='Loaded image: firmware-build:latest\n')
+        inspection = json.dumps([{'Id': runtime_id, 'Architecture': 'amd64', 'Os': 'linux'}]).encode()
+        with tempfile.TemporaryDirectory() as temp, \
+                patch.object(firmware, 'load_lock', return_value=document), \
+                patch.object(firmware, 'download'), \
+                patch.object(firmware.subprocess, 'Popen', return_value=decompressor), \
+                patch.object(firmware.subprocess, 'check_output', return_value=inspection) as inspect, \
+                patch.object(firmware.subprocess, 'run', return_value=loaded) as run:
+            firmware.rebuild('/unused/LOCK.json', temp, ['x86_64'])
+            self.assertIn('firmware-build:latest', inspect.call_args.args[0])
+            command = run.call_args.args[0]
+            self.assertIn(runtime_id, command)
+            self.assertNotIn(document['environment']['image_id'], command)
+            self.assertIn('--pull=never', command)
+            self.assertIn('none', command)
+
+    def test_load_rejects_missing_or_ambiguous_reference_and_wrong_platform(self):
+        valid = {'Id': 'sha256:' + 'e' * 64, 'Architecture': 'amd64', 'Os': 'linux'}
+        cases = [('', valid), ('Loaded image: one\nLoaded image: two\n', valid),
+                 ('Loaded image: one\n', dict(valid, Architecture='arm64')),
+                 ('Loaded image: one\n', dict(valid, Os='windows'))]
+        for stdout, image in cases:
+            with self.subTest(stdout=stdout, image=image):
+                decompressor = MagicMock()
+                decompressor.wait.return_value = 0
+                decompressor.poll.return_value = 0
+                with patch.object(firmware.subprocess, 'Popen', return_value=decompressor), \
+                        patch.object(firmware.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, stdout=stdout)), \
+                        patch.object(firmware.subprocess, 'check_output', return_value=json.dumps([image]).encode()):
+                    with self.assertRaises(ValueError):
+                        firmware.load_environment(Path('/unused/archive.tar.zst'))
 
 
 if __name__ == '__main__':

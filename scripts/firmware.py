@@ -127,6 +127,34 @@ def publish_release(lock_path):
     return releases.publish(lock['release']['repository'], lock, directory)
 
 
+def load_environment(archive):
+    """Resolve the loaded image on this daemon; IDs can differ between stores."""
+    zstd = subprocess.Popen(['zstd', '-dc', str(archive)], stdout=subprocess.PIPE)
+    try:
+        loaded = subprocess.run(['docker', 'load'], stdin=zstd.stdout, check=True,
+                                stdout=subprocess.PIPE, text=True)
+        zstd.stdout.close()
+        if zstd.wait() != 0:
+            raise ValueError('frozen environment decompression failed')
+    finally:
+        zstd.stdout.close()
+        if zstd.poll() is None:
+            zstd.kill()
+            zstd.wait()
+    references = {match.group(1) for line in loaded.stdout.splitlines()
+                  if (match := re.fullmatch(r'Loaded image(?: ID)?: (\S+)', line))}
+    if len(references) != 1:
+        raise ValueError('frozen environment must load exactly one image')
+    images = json.loads(subprocess.check_output(['docker', 'image', 'inspect', references.pop()]))
+    if not isinstance(images, list) or len(images) != 1 or not isinstance(images[0], dict):
+        raise ValueError('invalid loaded image inspection')
+    image = images[0]
+    if (not re.fullmatch(r'sha256:[0-9a-f]{64}', image.get('Id', ''))
+            or image.get('Os') != 'linux' or image.get('Architecture') != 'amd64'):
+        raise ValueError('frozen environment must be a Linux amd64 image')
+    return image['Id']
+
+
 def rebuild(lock_path, output, targets=None):
     lock = load_lock(lock_path)
     output = Path(output).resolve()
@@ -140,21 +168,10 @@ def rebuild(lock_path, output, targets=None):
     for record in [lock['environment']] + [lock['targets'][target]['inputs'] for target in selected]:
         download(base + record['filename'], inputs / record['filename'], record['sha256'], record['bytes'])
     environment = inputs / lock['environment']['filename']
-    zstd = subprocess.Popen(['zstd', '-dc', str(environment)], stdout=subprocess.PIPE)
-    try:
-        subprocess.run(['docker', 'load'], stdin=zstd.stdout, check=True)
-        zstd.stdout.close()
-        if zstd.wait() != 0:
-            raise ValueError('frozen environment decompression failed')
-    finally:
-        if zstd.poll() is None:
-            zstd.kill()
-            zstd.wait()
-    subprocess.run(['docker', 'image', 'inspect', lock['environment']['image_id']], check=True,
-                   stdout=subprocess.DEVNULL)
-    subprocess.run(['docker', 'run', '--rm', '--network', 'none',
+    image_id = load_environment(environment)
+    subprocess.run(['docker', 'run', '--rm', '--pull=never', '--network', 'none',
                     '--user', f'{os.getuid()}:{os.getgid()}',
-                    '-v', f'{output}:/work', lock['environment']['image_id'],
+                    '-v', f'{output}:/work', image_id,
                     '_replay', '/work/run/LOCK.json', '--targets', *selected], check=True)
     print(f'All requested images match LOCK.json: {output / "targets"}')
 
@@ -181,6 +198,8 @@ def main():
         seal.add_argument('--' + argument, required=True)
     publish = commands.add_parser('publish')
     publish.add_argument('lock')
+    environment = commands.add_parser('_load-environment')
+    environment.add_argument('archive')
     for name in ('rebuild', '_replay'):
         replay = commands.add_parser(name)
         replay.add_argument('lock')
@@ -207,6 +226,8 @@ def main():
                     args.image_id, args.commit, args.repository, args.output)
     elif args.command == 'publish':
         print(publish_release(args.lock))
+    elif args.command == '_load-environment':
+        print(load_environment(args.archive))
     elif args.command == 'rebuild':
         rebuild(args.lock, args.output, args.targets)
     elif args.command == '_replay':
