@@ -195,6 +195,26 @@ class VerifyOutputTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.run_verify(expected=expected)
 
+    def test_replay_accepts_permuted_metadata_image_list(self):
+        extra = copy.deepcopy(self.metadata['profiles']['generic']['images'][0])
+        extra.update(name='arbitrary-next-major-full-squashfs-rootfs.img.gz', type='rootfs')
+        shutil.copyfile(self.out / self.image_name, self.out / extra['name'])
+        self.metadata['profiles']['generic']['images'].append(extra)
+        self.save_metadata()
+        expected = self.run_verify()
+        self.metadata['profiles']['generic']['images'].reverse()
+        self.save_metadata()
+        actual = self.run_verify(expected=expected)
+        self.assertEqual(actual, expected)
+        self.assertEqual(self.metadata['profiles']['generic']['images'][0]['name'], extra['name'])
+
+    def test_replay_rejects_other_metadata_changes_after_reordering(self):
+        expected = self.run_verify()
+        self.metadata['profiles']['generic']['title'] = 'changed device title'
+        self.save_metadata()
+        with self.assertRaisesRegex(ValueError, 'metadata'):
+            self.run_verify(expected=expected)
+
     def test_replay_requires_exact_image_digest(self):
         expected = self.run_verify()
         (self.fs / 'new-file').write_text('different but valid filesystem\n')

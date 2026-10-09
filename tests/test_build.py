@@ -228,6 +228,21 @@ class BuildTests(unittest.TestCase):
         self.assertEqual(set(target_result['presets']), {'full', 'minimal'})
         self.assertTrue((self.work / 'artifacts' / target_result['inputs']['filename']).is_file())
 
+    def test_replay_metadata_image_order_is_semantic_but_contents_are_exact(self):
+        expected = {'metadata': {'profiles': {'generic': {'images': [
+            {'name': 'efi.img.gz', 'sha256': 'a' * 64, 'size': 3},
+            {'name': 'rootfs.img.gz', 'sha256': 'b' * 64, 'size': 4},
+        ]}}}}
+        actual = copy.deepcopy(expected)
+        actual['metadata']['profiles']['generic']['images'].reverse()
+        build.compare_replay(actual, expected)
+        self.assertEqual(expected['metadata']['profiles']['generic']['images'][0]['name'], 'efi.img.gz')
+        for field, value in [('name', 'renamed.img.gz'), ('sha256', 'c' * 64), ('size', 5)]:
+            changed = copy.deepcopy(actual)
+            changed['metadata']['profiles']['generic']['images'][0][field] = value
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, 'metadata'):
+                build.compare_replay(changed, expected)
+
     def test_restore_rejects_image_replay_mismatch(self):
         frozen = self.root / 'frozen-source'
         frozen.mkdir()

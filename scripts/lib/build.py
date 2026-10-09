@@ -13,7 +13,7 @@ from .inputs import (available_packages, capture_repositories, download,
                      extract_archive, file_record, make_bundle,
                      requested_packages, select_packages, sha256)
 from .lock import PRESETS, TARGETS
-from .verify import verify_output
+from .verify import canonical_metadata, verify_output
 
 
 _ARCHIVE = re.compile(r'immortalwrt-imagebuilder-[A-Za-z0-9+._-]+\.Linux-x86_64\.tar\.zst')
@@ -246,7 +246,12 @@ def run_imagebuilder(context, preset, packages, out, recipe_root, repositories=N
 def compare_replay(actual, expected):
     """Fail on any image-byte or exact package-manifest disagreement."""
     for key in ('images', 'manifest', 'manifest_sha256', 'metadata'):
-        if key in expected and actual.get(key) != expected[key]:
+        if key not in expected:
+            continue
+        left, right = actual.get(key), expected[key]
+        if key == 'metadata':
+            left, right = canonical_metadata(left), canonical_metadata(right)
+        if left != right:
             raise ValueError(f'offline replay differs in {key}')
 
 

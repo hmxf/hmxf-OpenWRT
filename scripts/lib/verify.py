@@ -1,6 +1,7 @@
 """Verify generated firmware identity, boot layout, and embedded filesystem."""
 from __future__ import annotations
 
+import copy
 import gzip
 import hashlib
 import json
@@ -45,6 +46,18 @@ def _invalid_constant(value):
     raise ValueError(f'invalid JSON constant: {value}')
 
 
+def canonical_metadata(metadata):
+    """Upstream builds image lists from unsorted directory iteration."""
+    metadata = copy.deepcopy(metadata)
+    if isinstance(metadata, dict) and isinstance(metadata.get('profiles'), dict):
+        for profile in metadata['profiles'].values():
+            if isinstance(profile, dict) and isinstance(profile.get('images'), list):
+                images = profile['images']
+                if all(isinstance(image, dict) and isinstance(image.get('name'), str) for image in images):
+                    images.sort(key=lambda image: image['name'])
+    return metadata
+
+
 def _load_metadata(path: Path) -> dict:
     _regular(path)
     try:
@@ -54,7 +67,7 @@ def _load_metadata(path: Path) -> dict:
         raise ValueError(f'invalid profiles.json: {exc}') from exc
     if not isinstance(metadata, dict):
         raise ValueError('profiles.json must be an object')
-    return metadata
+    return canonical_metadata(metadata)
 
 
 def _check_metadata(metadata: dict, expected: dict, target: str) -> dict:
@@ -247,7 +260,10 @@ def verify_output(output_dir, target, expected_metadata, requested_packages, rec
     result = {'images': records, 'manifest': lines, 'manifest_sha256': digest, 'metadata': metadata}
     if expected_result is not None:
         for field in ('images', 'manifest', 'manifest_sha256', 'metadata'):
-            if result[field] != expected_result.get(field):
+            expected = expected_result.get(field)
+            if field == 'metadata':
+                expected = canonical_metadata(expected)
+            if result[field] != expected:
                 raise ValueError(f'offline replay {field} mismatch')
     images = [output / record['filename'] for record in records]
     _verify_structure(images, target, metadata, recipe)
