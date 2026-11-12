@@ -2,7 +2,7 @@ name: Latest stable firmware
 
 on:
   schedule:
-    - cron: '0 17 * * *' # 01:00 Asia/Shanghai (UTC+8)
+    - cron: '17 2 * * *'
   workflow_dispatch:
     inputs:
       force:
