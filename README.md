@@ -22,6 +22,8 @@
 
 复现过程使用该次发布冻结的官方 ImageBuilder、内核与软件包、构建工具和本仓库配方组装镜像。`LOCK.json` 记录源码与配方提交、输入摘要、软件包清单以及每个发布镜像的文件名、大小和 SHA256。
 
+文件时间、镜像压缩头和磁盘标识沿用 OpenWrt/ImageBuilder 的原生可复现机制。构建脚本使用官方元数据中的 `SOURCE_DATE_EPOCH`，并固定 `LC_ALL=C`、`TZ=UTC` 和 `umask=022`；冻结输入归档按路径排序，规范化权限、所有者与时间戳。构建环境的软件包版本保存在冻结 Docker 镜像的包数据库中，重建时直接加载同一环境，无需重新安装可能已变化的系统依赖。
+
 需要 x86_64 Linux、Python 3、Docker 和 zstd，无需维护者的 GitHub 凭据。先从目标 Release 下载 `LOCK.json`，然后运行：
 
 ```sh

@@ -218,7 +218,7 @@ def run_imagebuilder(context, preset, packages, out, recipe_root, repositories=N
                     'PROFILE=' + context['spec']['profile'],
                     'PACKAGES=' + ' '.join(selected), 'FILES=' + str(recipe_root / 'files'),
                     'ROOTFS_PARTSIZE=3072', 'EXTRA_IMAGE_NAME=' + preset],
-                   env=env, check=True)
+                   env=env, umask=0o022, check=True)
     for path, digest in pinned_indexes:
         if sha256(path) != digest:
             raise ValueError('live APK resolution changed a frozen signed package index')

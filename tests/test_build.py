@@ -170,6 +170,33 @@ class BuildTests(unittest.TestCase):
                 build.run_imagebuilder(context, 'full', ['base'], self.work / 'artifacts/full', self.recipe)
         self.assertEqual(failure.exception.returncode, 7)
 
+    def test_imagebuilder_environment_is_independent_of_parent_defaults(self):
+        context = self.fixture_context()
+        make = self.tools / 'make'
+        make.write_text(make.read_text() + "\nimport json, os\n"
+                        "(out / 'environment.json').write_text(json.dumps({\n"
+                        "    'epoch': os.environ['SOURCE_DATE_EPOCH'],\n"
+                        "    'locale': os.environ['LC_ALL'], 'timezone': os.environ['TZ'],\n"
+                        "    'umask': os.umask(0),\n"
+                        "}))\n")
+        expected = {'epoch': str(METADATA['source_date_epoch']),
+                    'locale': 'C', 'timezone': 'UTC', 'umask': 0o022}
+        with mock.patch.dict(os.environ, {'SOURCE_DATE_EPOCH': '1',
+                                         'LC_ALL': 'C.UTF-8', 'TZ': 'Asia/Shanghai'}), \
+             mock.patch.object(build, 'available_packages', side_effect=self.fake_available), \
+             mock.patch.object(build, 'verify_output', return_value={}):
+            for preset, mask in [('full', 0o022), ('minimal', 0o077)]:
+                with self.subTest(umask=oct(mask)):
+                    out = self.work / 'artifacts' / preset
+                    previous = os.umask(mask)
+                    try:
+                        build.run_imagebuilder(context, preset, ['base'], out, self.recipe)
+                        restored = os.umask(previous)
+                    finally:
+                        os.umask(previous)
+                    self.assertEqual(restored, mask, 'build must not change the parent umask')
+                    self.assertEqual(json.loads((out / 'environment.json').read_text()), expected)
+
     def test_offline_uses_local_repositories_and_clears_live_cache(self):
         context = self.fixture_context()
         repositories = self.root / 'repositories'
